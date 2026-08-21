@@ -1,0 +1,226 @@
+# goal / tune -> kernel utility
+#
+# 这是整个设计的枢纽：它证明「抽象的内核」与「好用的接口」严丝合缝。
+# 客户只说 goal 和形容词；(rho, gamma, V, Phi) 永不出现在对外契约里。
+#
+# 漏抽象判据：客户为达成目标必须理解本文件右侧的数学 -> 翻译层失败。
+
+version: 1
+
+# ---------------------------------------------------------------------------
+# tune 旋钮：形容词 / 百分比 -> 内核参数
+# 客户永远不需要知道 0.70 这个数存在。
+# ---------------------------------------------------------------------------
+tune_maps:
+
+  difficulty:
+    _maps_to: rho.target
+    _note: 期望成功率。越"难"= 目标成功率越低。
+    easy: 0.85
+    moderate: 0.70
+    hard: 0.55
+    brutal: 0.40
+
+  focus:
+    _maps_to: structure
+    _note: 集合结构。多样性并非无条件更好——放大长板时集中反而正确。
+    narrow: { kind: concentrate, weight: 0.60 }
+    balanced: { kind: balanced, weight: 0.20, target_entropy: 1.5 }
+    broad: { kind: diversify, weight: 0.80 }
+
+
+  freshness:
+    _maps_to: explore_floor
+    _note: >
+      0..1 直通（不含 1）。留给高不确定度候选的最低比例。
+      1.0 不允许：全部槽位都用于探索就没有任何利用，
+      与 utility.explore_floor 的边界保持一致。
+    _range: "[0.0, 1.0)"
+
+
+  stakes:
+    _maps_to: rho.width
+    _note: 容错带宽。高风险场景收窄，允许偏离目标成功率的幅度更小。
+    low: 0.22
+    normal: 0.15
+    high: 0.08
+
+# ---------------------------------------------------------------------------
+# goal：业务意图 -> 完整效用泛函
+# 命名一律用意图，不用算法名。客户看到的是"练薄弱"，不是"IRT peak scoring"。
+#
+# 每个 goal 的 utility 块是该 goal 参数的唯一来源。tune 只在调用方显式传入时
+# 覆盖其中对应字段；goal 不再声明 defaults。
+# 原因：defaults 会被当作 tune 施加到 utility 上，把 utility 里声明的值直接
+# 冲掉（review 声明 weight 1.20 却被 focus=broad 的 0.80 覆盖，等于死代码）。
+# 同一个数字有两个出处，最终一定有一处是谎言。
+# goal 的"形容词画像"由 describe() 反查 tune_maps 得出，是派生值而非第二份数据。
+# ---------------------------------------------------------------------------
+goals:
+
+  assess:
+    label: 摸底测评
+    intent: 用最少交互摸清 user 当前水平，不关心单次成败。
+    utility:
+      rho: { kind: constant }
+      gamma: 1.0
+      value: { kind: neg_entropy, dim_weight: high_var }
+      structure: { kind: diversify, weight: 0.50 }
+      explore_floor: 0.0
+      transition_model: info_only
+    note: >
+      rho=0 的纯信息增益特例，等价于自适应测评(CAT)。
+      Fisher 信息在 p_hat≈0.5 处最大，故"选最不确定的"从公式自然导出，
+      无需单独设计冷启动策略。
+
+  practice_weak:
+    label: 练薄弱
+    intent: 定位弱项并推动其提升。
+    utility:
+      rho: { kind: peak, target: 0.70, width: 0.15 }
+      gamma: 0.30
+      value: { kind: mastery_sum, dim_weight: low_mu }
+      structure: { kind: diversify, weight: 0.80 }
+      explore_floor: 0.10
+      transition_model: monotone_gain
+
+
+  challenge:
+    label: 拔高
+    intent: 在已有强项上继续加压，突破上限。
+    utility:
+      rho: { kind: peak, target: 0.50, width: 0.18 }
+      gamma: 0.40
+      value: { kind: mastery_sum, dim_weight: high_mu }
+      structure: { kind: concentrate, weight: 0.30 }
+      explore_floor: 0.15
+      transition_model: monotone_gain
+
+
+  review:
+    label: 复习巩固
+    intent: 抢在遗忘发生前复习最可能松动的部分。
+    utility:
+      rho: { kind: peak, target: 0.80, width: 0.12 }
+      gamma: 0.20
+      value: { kind: mastery_sum, dim_weight: high_var }
+      structure: { kind: diversify, weight: 1.20 }
+      explore_floor: 0.05
+      transition_model: monotone_gain
+
+    note: >
+      dim_weight=high_var 而非 low_mu：复习的对象是"不确定是否还会"的维度，
+      而非"确定不会"的维度——后者属于 practice_weak。
+      目标成功率取高(0.80)以保留成功体验。
+
+  more_like_this:
+    label: 推同类
+    intent: user 偏好什么就加强同类推送。
+    utility:
+      rho: { kind: increasing }
+      gamma: 0.0
+      value: null
+      structure: { kind: concentrate, weight: 0.70 }
+      explore_floor: 0.10
+      transition_model: null
+    note: >
+      gamma=0 —— 利用状态而非改变状态，这是与全部学习类 goal 的根本分界。
+      与 practice_weak 的差异仅在 rho 与 Phi 的取法，并非另一套算法。
+      explore_floor 不允许配为 0：纯放大会收敛成过滤气泡。
+
+  explore:
+    label: 拓展新领域
+    intent: 带 user 走出当前舒适区，扩大覆盖面。
+    utility:
+      rho: { kind: increasing }
+      gamma: 0.50
+      value: { kind: info_gain, dim_weight: high_var }
+      structure: { kind: diversify, weight: 1.00 }
+      explore_floor: 0.30
+      transition_model: info_only
+
+  screen:
+    label: 风险筛查
+    intent: 优先找出最可能出问题的部分。
+    utility:
+      rho: { kind: decreasing }
+      gamma: 0.0
+      value: null
+      structure: { kind: diversify, weight: 0.60 }
+      explore_floor: 0.05
+      transition_model: null
+    note: 与 more_like_this 仅 rho 方向相反，验证 rho 的四种取法已张满该空间。
+
+# ---------------------------------------------------------------------------
+# 默认 goal：L0 零配置调用落到这里。
+# 默认值必须是"好"的而非"中性"的——它就是产品的第一印象。
+# ---------------------------------------------------------------------------
+default_goal: practice_weak
+
+# ---------------------------------------------------------------------------
+# 防误用校验：在 policy 装载期执行，不等到线上才发现。
+# ---------------------------------------------------------------------------
+validation:
+
+  - id: learning_goals_need_peak
+    rule: "goal in [practice_weak, challenge, review] => utility.rho.kind == 'peak'"
+    severity: error
+    reason: >
+      学习类目标若用 increasing，会持续推送最容易的候选（p_hat 最高），
+      表面指标好看但状态毫无提升。这是最易犯且最难察觉的误配。
+
+  - id: amplification_needs_explore_floor
+    rule: "utility.gamma == 0 and utility.structure.kind == 'concentrate' => utility.explore_floor >= 0.05"
+    severity: error
+    reason: 纯利用 + 集中会自我强化，收敛到极窄推荐，长期伤留存。
+
+  - id: lookahead_needs_transition_model
+    rule: "utility.gamma > 0 => utility.transition_model != null"
+    severity: error
+    reason: >
+      gamma>0 需要估计"作用后状态如何变化"。转移模型天生领域相关
+      （技能习得 vs 偏好漂移），抽象无法消除，必须显式提供。
+
+  - id: target_dim_weight_needs_target
+    rule: "utility.value.dim_weight == 'target' => utility.value.target != null"
+    severity: error
+    reason: 按目标画像塑形时必须给出目标画像。
+
+  - id: peak_target_in_range
+    rule: "utility.rho.kind == 'peak' => 0.30 <= utility.rho.target <= 0.95"
+    severity: warn
+    reason: 目标成功率过低会持续挫败，过高则无学习增益。
+
+  - id: structure_weight_nonnegative
+    rule: "utility.structure.weight >= 0"
+    severity: error
+    reason: >
+      分散与集中是两个平级策略（kind），不通过权重变号表达。
+      负权重会让 Phi 失去次模性，破坏 Choose 的 (1-1/e) 近似保证。
+
+# ---------------------------------------------------------------------------
+# 参数出处：不允许再出现无依据的常数。
+# 老一代实现里 S=1.84、penalty_weight=0.3 之类的数字凭空拍定，
+# 本文件的每个数值都必须标注来源，未经校准者显式标记。
+# ---------------------------------------------------------------------------
+provenance:
+  status: uncalibrated
+  note: >
+    当前全部数值为待校准初值。校准方法：按实际成功率分桶，
+    统计各桶内 user 在相应维度上的后续状态提升幅度，
+    取提升最大的区间作为 rho.target；Phi/gamma 权重用离线评估上的贝叶斯优化搜索。
+    校准完成前，这些数字不得写入对外文档或 SLA。
+  calibration_owner: TBD
+  calibrated_at: null
+  attempts:
+    - target: rho.target
+      method: engine/calibrate.py，在参考模拟器上按预测成功率分桶测真实能力提升
+      date: 2026-08-20
+      result: rejected
+      finding: >
+        增益曲线单调升到网格边缘(0.80/0.90)，无内部极值。模拟器学习规则
+        gain ∝ (0.4 + 0.6*outcome) 结构上不可能产生峰；再注入 desirable-difficulty
+        只会校准出被注入的值，循环论证。故 rho.target 维持 uncalibrated。
+        被验证的是估计器（它正确拒绝了不存在的峰），不是数值本身。
+        真实校准需带状态提升信号的线上日志。
+

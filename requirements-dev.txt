@@ -1,0 +1,5 @@
+# Test-only dependencies. Kept out of requirements.txt (and out of the image)
+# so the runtime container does not carry a test runner and an HTTP client it
+# never executes. Install with:  pip install -r requirements.txt -r requirements-dev.txt
+httpx==0.28.1
+pytest==8.3.4

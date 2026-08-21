@@ -1,0 +1,130 @@
+# Adapter: commerce（电商 / 内容推荐）
+#
+# 存在的唯一目的：验证内核是否真的领域无关。
+# 同一个 core.py、同一份 goals.yaml、同一套 API —— 与 jzjx 只差这份映射和所选 goal。
+# 若内核接不住这个与教育截然不同的场景，说明抽象没做对。
+#
+# 词汇对照（业务 -> 内核）
+#   顾客 customer     -> user
+#   商品 product      -> item
+#   品类/风格 category -> tag
+#   点击/加购/购买     -> signal
+#   偏好画像           -> profile
+#
+# 与 jzjx 的根本差异只有一处：gamma = 0。
+# 电商**利用**状态（偏好视为给定），教育**改变**状态（学习本身是目的）。
+# 这一个数决定了要不要转移模型、要不要前瞻——其余全靠参数配置区分。
+
+adapter:
+  id: commerce
+  mode: push                    # 电商多为实时上报
+  note: |
+    与 jzjx 对照阅读即可看出抽象是否成立：
+    “补短板 vs 强长板”“分散 vs 集中”“改变状态 vs 利用状态”
+    全部落在参数上，内核代码一行都不用改。
+
+# ---------------------------------------------------------------------------
+# signal：多种行为归一到同一个 [0,1] outcome
+# ---------------------------------------------------------------------------
+signals:
+
+  - name: interaction
+    source: push                # 走 /v1/signals
+    map:
+      user: customer_id
+      item: product_id
+      ts: event_time
+      outcome:
+        # 不同行为强度归一到 [0,1]。同一字段覆盖点击/加购/购买/退货，
+        # 与 jzjx 里覆盖对错/得分率是完全相同的机制。
+        from: event_type
+        normalize:
+          view: 0.1
+          click: 0.3
+          add_to_cart: 0.6
+          purchase: 1.0
+          return: 0.0           # 退货作为负反馈
+        on_unmapped: skip
+      context:
+        channel: channel
+        price_at_event: price
+    # 电商天然是曝光偏置重灾区：顾客只看到被推过的商品。
+    # 与 jzjx 不同，这里从第一天就能拿到 propensity，务必记录。
+    propensity:
+      available: true
+      field: served_propensity
+      note: 前端埋点须回传推荐位的曝光概率，否则偏好模型会自我强化成信息茧房。
+
+# ---------------------------------------------------------------------------
+# item：商品元数据。同样不接收标题/详情/图片正文。
+# ---------------------------------------------------------------------------
+items:
+  source: push
+  key:
+    id: product_id
+  map:
+    # 电商没有天然“难度”。increasing 型 rho 不依赖 difficulty，留空即可。
+    difficulty_hint: null
+    attrs:
+      kind: category_l1
+      price: price
+      in_stock: in_stock
+      brand: brand
+  note: difficulty_hint 为空说明 rho=peak 类 goal 不适用于本场景——这符合预期。
+
+# ---------------------------------------------------------------------------
+# tag：商品 -> 品类/风格，可带权重；也允许完全不打 tag
+# ---------------------------------------------------------------------------
+tags:
+  source: push
+  map:
+    item: product_id
+    tag: category_path          # 如 "服饰/男装/衬衫"
+    weight:
+      default: 1.0
+      normalize: sum_to_one
+  taxonomy:
+    optional: true
+    note: |
+      演示“无前置建模”：客户若暂时不整理品类树，可完全省略 tags，
+      引擎退化为单维亲和度模型，照样可用。日后补 tag 再细化到维度级。
+
+# ---------------------------------------------------------------------------
+# 硬约束
+# ---------------------------------------------------------------------------
+constraints:
+  predicates:
+    - "attrs.in_stock == true"          # 无货不推
+    - "attrs.tenant == $tenant"         # 商户隔离，与 jzjx 同一机制
+
+# ---------------------------------------------------------------------------
+# 场景：与 jzjx 用的是同一批 goal，取值却几乎相反 —— 这正是通用性的证据
+# ---------------------------------------------------------------------------
+scenarios:
+
+  猜你喜欢:
+    goal: more_like_this
+    tune: { focus: narrow, freshness: 0.1 }
+    note: |
+      对照 jzjx 的“同步练习”(practice_weak, focus:broad)：
+      同一内核，rho 从 peak 变 increasing，Φ 从 diversify 变 concentrate，
+      gamma 从 >0 变 0。方向完全相反，代码零改动。
+
+  高客单价加权:
+    # 用自定义 policy（L3）按客单价加权 —— 展示 value_attr 把计价挡在内核外
+    policy_ref: affinity_boost_gmv
+
+  拓展兴趣:
+    goal: explore
+    tune: { focus: broad, freshness: 0.35 }
+    note: 防信息茧房。与 jzjx 的“入学摸底”共享 explore/assess 的信息增益内核。
+
+  新客冷启动:
+    goal: assess
+    tune: { focus: broad }
+    note: |
+      无历史时用信息增益快速定位偏好，与 jzjx 的“入学摸底”是同一段代码
+      （ρ=0, V=neg_entropy）。冷启动不是兜底，是主打功能。
+
+# 无 writeback：电商通常不需要把 profile 回写业务库，读接口 /v1/profile 足够。
+# 这也说明 writeback 是 adapter 级可选项，而非内核职责。

@@ -1,0 +1,22 @@
+# Build context excludes: keep the image small and keep local state out of it.
+# A stray adaptive.db copied into the image would ship one machine's tenants and
+# API-key digests to every deployment, and a local adaptive.yaml would bake one
+# machine's database path and worker count into every deployment. Mount the config
+# at runtime (or point ADAPTIVE_CONFIG at it) instead.
+*.db
+*.db-wal
+*.db-shm
+adaptive.yaml
+.git
+.github
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+tests/
+examples/
+*.md
+!README.md
+Dockerfile
+.dockerignore

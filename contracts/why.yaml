@@ -1,0 +1,66 @@
+# Presentation strings. Data, not code, for one reason: a tenant that wants a
+# different language or a different tone must not need a code change and a
+# redeploy to get it. The engine emits machine-readable reasons and has no
+# vocabulary of its own (that is the iron rule); this file is the only place
+# user-facing prose lives.
+#
+# Adding a locale is a data change reviewable by whoever owns the copy. Missing
+# keys fall back to `default_locale`, so a partial translation degrades to mixed
+# language rather than to a KeyError in a served response.
+#
+# `why` templates receive {pct} -- the predicted success percentage.
+# `hints` are keyed by the engine's fallback_reason, so a new reason without a
+# hint is visible (no hint returned) rather than mislabelled.
+
+default_locale: zh
+
+locales:
+
+  zh:
+    why:
+      explore: "扩大覆盖：这一项当前最不确定，答完能提供最多信息（预计成功率 {pct}%）"
+      structure_neg: "与已选内容差异较大，用于铺开覆盖面（预计成功率 {pct}%）"
+      structure_pos: "与已选内容同类，用于加强这个方向（预计成功率 {pct}%）"
+      fit: "与当前水平最匹配（预计成功率 {pct}%）"
+    hints:
+      cold_start_no_signals: >
+        该用户还没有历史记录，结果来自先验而非证据。照常使用即可；把结果回传到
+        /v1/signals 之后置信度会自己升上来，不需要特殊处理。
+      empty_candidate_pool: >
+        候选池是空的。先用 /v1/items 登记候选，或者放宽 within 过滤条件；用
+        GET /v1/items 可以确认目录里到底有什么。
+      constraints_unsatisfiable: >
+        约束无解——quota / max_per_tag / predicate 的组合过紧。放宽其中一项，或
+        减小 count。响应里已返回的部分是在约束下能给出的全部。
+      insufficient_candidates: >
+        满足约束的候选不足 count 个。补充候选、降低 count，或放宽约束；这不是
+        错误，是目录容量的实际情况。
+      no_taxonomy_registered: >
+        该租户还没有任何标签。引擎会退化成单维模型继续工作，但按标签维度的画像
+        要等 item 带上 tags 之后才有。
+
+  en:
+    why:
+      explore: "Widening coverage: the most uncertain item right now, so it is the most informative ({pct}% predicted success)"
+      structure_neg: "Different from what is already selected, to spread coverage ({pct}% predicted success)"
+      structure_pos: "Same direction as what is already selected, to reinforce it ({pct}% predicted success)"
+      fit: "Closest match to the current level ({pct}% predicted success)"
+    hints:
+      cold_start_no_signals: >
+        This user has no history yet, so the result rests on the prior rather than
+        on evidence. Use it as normal; confidence rises on its own once outcomes
+        are reported to /v1/signals. No special handling needed.
+      empty_candidate_pool: >
+        The candidate pool is empty. Register items via /v1/items or relax the
+        `within` filter; GET /v1/items shows what the catalogue actually holds.
+      constraints_unsatisfiable: >
+        No feasible set exists -- the quota / max_per_tag / predicate combination
+        is too tight. Relax one of them or lower `count`. Whatever was returned is
+        all the constraints allow.
+      insufficient_candidates: >
+        Fewer admissible candidates than `count`. Add items, lower `count`, or
+        relax constraints. This is catalogue capacity, not an error.
+      no_taxonomy_registered: >
+        No tags registered for this tenant. The engine degrades to a single latent
+        dimension and keeps working, but per-tag profiles only appear once items
+        carry tags.

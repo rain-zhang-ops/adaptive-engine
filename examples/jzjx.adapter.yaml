@@ -1,0 +1,197 @@
+# Adapter: jzjx（K12 AI 精准教学平台）
+#
+# 作用：把客户业务模型映射成内核本体。这份文件是抽象是否成立的**验证样例**之一
+# —— 全部教育业务词汇止步于此，一个都不进内核。
+#
+# 词汇对照（业务 -> 内核）
+#   学生 student        -> user
+#   题目 question       -> item
+#   大纲知识点 knowledge -> tag
+#   批改记录 correcting  -> signal
+#   学情画像 mastery     -> profile
+#
+# 私有化部署走本文件的 pull 模式；SaaS 走 /v1/signals push 模式，
+# 两者只差 source 段，映射规则完全复用。
+
+adapter:
+  id: jzjx
+  mode: pull                    # pull（连客户库） | push（客户上报）
+  dialect: mysql
+  note: |
+    首个 reference customer。它的定位是验证 L1 抽象够不够通用——
+    能干净接住它，才有底气接下一家。但它的概念不许反向渗入内核。
+
+# ---------------------------------------------------------------------------
+# signal：作业批改 + 考试批改，UNION 成统一的交互流
+# ---------------------------------------------------------------------------
+signals:
+
+  - name: homework
+    source: edu_homework_correcting
+    map:
+      user: student_id
+      item: ai_question_id
+      ts: created_time
+      outcome:
+        # 老师批改优先于 AI 批改：teacher_result 有值时覆盖 question_result。
+        # 这条规则必须在 adapter 层落地，内核只接受 [0,1] 数值。
+        expr: "coalesce(nullif(teacher_result, ''), question_result)"
+        normalize:
+          "正确": 1.0
+          "对": 1.0
+          "半对": 0.5
+          "部分正确": 0.5
+          "错误": 0.0
+          "错": 0.0
+        on_unmapped: skip       # 值域外的记录丢弃，不猜
+      context:
+        source_kind: { const: homework }
+        is_must_do: is_must_do
+        error_type: question_error_type
+    filters:
+      - "deleted = 0"
+      - "coalesce(nullif(teacher_result,''), question_result) is not null"
+    incremental_key: last_modified_time
+
+  - name: exam
+    source: edu_exam_plan_correcting
+    map:
+      user: student_id
+      item: ai_question_id
+      ts: created_time
+      outcome:
+        expr: "coalesce(nullif(teacher_result, ''), question_result)"
+        normalize:
+          "正确": 1.0
+          "半对": 0.5
+          "错误": 0.0
+        on_unmapped: skip
+      context:
+        source_kind: { const: exam }
+    filters:
+      - "deleted = 0"
+    incremental_key: last_modified_time
+
+  # 反馈从来不是随机样本，它是上一版策略选出来的。
+  # 老库没有记录 propensity，因此历史数据无法纠偏——这是既成事实，
+  # 只能保证从接入本引擎起的新数据带上它，且事后无法补齐。
+propensity:
+  available: false
+  note: 历史数据缺失 propensity，训练时须标记为 unknown-policy 段并降权。
+
+
+# ---------------------------------------------------------------------------
+# item：题目元数据。注意不取 content / options / correct_answer —— 引擎不碰正文。
+# ---------------------------------------------------------------------------
+items:
+  source: edu_question
+  key:
+    id: ai_question_id
+  map:
+    difficulty_hint:
+      # 业务侧是 1-3 等级（1 最易），内核要 [0,1] 且越大越难
+      expr: "(difficulty - 1) / 2.0"
+      clamp: [0.0, 1.0]
+      on_null: null             # 留空即可，引擎会退化到曝光统计
+    attrs:
+      kind: type
+      visibility: quiz_security_level
+      source_name: question_source
+  filters:
+    - "deleted = 0"
+    - "checked = 1"
+
+# ---------------------------------------------------------------------------
+# tag：题目 -> 大纲知识点，带权重与主辅之分
+# ---------------------------------------------------------------------------
+tags:
+  source: vector_question
+  group_by: question_id
+  map:
+    item: question_id
+    tag: knowledge_id
+    weight:
+      # 主知识点(tmzsd_type=0)承担主要权重，辅知识点次之，最后归一化。
+      # 主辅区分是客户的教研概念，内核只看到归一化后的权重向量。
+      expr: "case tmzsd_type when 0 then 1.0 else 0.35 end * coalesce(difficulty_weight, 1.0)"
+      normalize: sum_to_one
+  taxonomy:
+    source: edu_knowledge_point
+    map:
+      tag: id
+      parent: parent_id
+      label: name
+    note: 可选的 tag DAG。内核会在有 DAG 时沿边传播更新，缺失也不报错。
+
+  data_quality:
+    # 整套系统的地基是这份标注，而它由 LLM 打标，主辅知识点重复的问题在
+    # 客户侧尚未收敛。标注错了，任何模型都是 garbage-in-garbage-out。
+    checks:
+      - id: tag_consistency
+        method: 用作答数据反推——同一 tag 下的 item 成功率若无合理相关性，标注可疑
+        action: 输出可疑清单，不自动修正
+      - id: orphan_tag
+        method: vector_question.knowledge_id 在 edu_knowledge_point 中不存在
+        action: 丢弃该行并计数告警
+    gate: 标注质量报告未通过前，不得启用序列模型（只跑免训练模型）
+
+# ---------------------------------------------------------------------------
+# 硬约束：必须在召回阶段切掉，不能靠打分压低
+# ---------------------------------------------------------------------------
+constraints:
+  predicates:
+    # 考试专用题不得出现在练习推荐里。漏掉等于泄题。
+    - "attrs.visibility != 'exam_only'"
+    # 多租户隔离。老实现的候选查询没有这层过滤，新架构不继承该缺陷。
+    - "attrs.tenant == $tenant"
+
+# ---------------------------------------------------------------------------
+# 场景：全部用内置 goal + tune 表达，无需自定义 policy
+# ---------------------------------------------------------------------------
+scenarios:
+
+  同步练习:
+    goal: practice_weak
+    tune: { difficulty: moderate, focus: broad, freshness: 0.15 }
+    quota: [{ group_by: "attrs.kind", counts: { 选择题: 10, 填空题: 5, 解答题: 2 } }]
+
+  薄弱巩固:
+    goal: practice_weak
+    tune: { difficulty: easy, focus: broad, freshness: 0.1 }
+    exclude: { seen_within_days: 14, max_per_tag: 3 }
+
+  复习:
+    goal: review
+    tune: { difficulty: easy, focus: broad }
+
+  能力拔高:
+    goal: challenge
+    tune: { difficulty: hard, focus: narrow, freshness: 0.2 }
+
+  入学摸底:
+    goal: assess
+    tune: { focus: broad }
+
+  学科特长培养:
+    goal: more_like_this
+    tune: { focus: narrow, freshness: 0.1 }
+    note: |
+      同一客户同时需要补短板与强长板，因此方向必须是 per-request 的，
+      不能做成部署级配置。
+
+# ---------------------------------------------------------------------------
+# 回写：让画像与决策共用同一口径
+# ---------------------------------------------------------------------------
+writeback:
+  - target: vector_student
+    from: profile
+    map:
+      student_id: user
+      knowledge_id: tag
+      mastery_level: level
+      last_practiced_at: last_seen
+    reason: |
+      客户的平板端「学情画像」「易错点分析」页面读的是 vector_student。
+      若决策用新状态、画像用旧口径，同一学生会出现两套互相矛盾的掌握度，
+      老师一定会发现。全平台必须单一口径。
+    note: 客户侧原有的掌握度定时计算任务须同时停用，否则互相覆盖。

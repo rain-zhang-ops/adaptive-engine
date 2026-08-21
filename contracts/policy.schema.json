@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/adaptive-engine/policy.schema.json",
+  "title": "Policy (L3 escape hatch)",
+  "description": "自定义 policy 的完整声明。对应 core.py 的 Utility + Constraints，是内核表达力的全量暴露面。\n\n仅供 <1% 的高级客户使用；绝大多数客户应停在 openapi.yaml 的 goal + tune。\n之所以必须存在：若高级需求无处安放，它们会反过来污染 L1/L2 的主路径，把简单接口撑变形。\n\n【效力声明】本文件是文档，不是执行中的校验器：运行时没有任何代码读取它（工程不依赖 jsonschema）。真正拒绝非法 policy 的是 engine/policy.py 的装载期校验（枚举、区间、谓词编译、goals.yaml 的 validation 规则）。两者若冲突，以 engine/policy.py 为准，并应视为本文件的缺陷来修。这个取舍是有意的：与其引入一个只在部分路径生效的第二套校验，不如只保留一套并把它说清楚。",
+  "type": "object",
+  "required": ["id", "utility"],
+  "additionalProperties": false,
+
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9_-]{2,63}$",
+      "description": "policy 标识，请求里通过 policy_ref 引用。"
+    },
+    "label": { "type": "string", "description": "人类可读名称，用于控制台展示。" },
+    "extends": {
+      "type": "string",
+      "description": "继承某个内置 goal 后局部覆写。绝大多数自定义需求用这个即可，不必从零写。"
+    },
+
+    "utility": { "$ref": "#/$defs/Utility" },
+    "constraints": { "$ref": "#/$defs/Constraints" },
+
+    "believe": {
+      "enum": ["mtor"],
+      "description": "指定 Believe 实现。目前只实现了 mtor，其他值一律在注册时拒绝——留一个看起来可选的开关却只有一个合法值，比明写出来更容易误导。"
+    },
+
+
+    "provenance": {
+      "type": "object",
+      "description": "参数出处。硬性要求：任何数值都要说明依据。凭空拍定的常数是上一代实现失效的直接原因。",
+      "properties": {
+        "status": { "enum": ["uncalibrated", "calibrating", "calibrated"] },
+        "note": { "type": "string" },
+        "calibrated_at": { "type": ["string", "null"], "format": "date-time" }
+      },
+      "required": ["status"]
+    }
+  },
+
+  "$defs": {
+
+    "Utility": {
+      "type": "object",
+      "description": "U(A|b) = E_b[ Σ ρ(o_a) + γ·V(b') ] + Φ(A)",
+      "required": ["rho"],
+      "additionalProperties": false,
+      "properties": {
+
+        "rho": {
+          "$ref": "#/$defs/RewardSpec",
+          "description": "对单个 item 预测结果的偏好。"
+        },
+
+        "gamma": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0,
+          "description": "利用状态还是改变状态。0 = 只看即时回报（偏好放大类场景）；>0 = 追求状态提升（学习类场景）。这是全部场景的根本分界。"
+        },
+
+        "value": {
+          "oneOf": [{ "$ref": "#/$defs/ValueSpec" }, { "type": "null" }],
+          "description": "后继信念的价值。gamma > 0 时必填。"
+        },
+
+        "structure": {
+          "oneOf": [{ "$ref": "#/$defs/StructureSpec" }, { "type": "null" }],
+          "description": "集合结构泛函。"
+        },
+
+        "explore_floor": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1,
+          "default": 0,
+          "description": "留给高不确定度 item 的最低比例。一个机制同时承担两件事：纠正反馈数据的选择偏差，以及防止纯放大策略收敛成过滤气泡。纯利用型 policy 不得设为 0；1.0 也不允许——全部槽位都用于探索就没有任何利用。"
+        },
+
+        "transition_model": {
+          "enum": [null, "info_only", "monotone_gain", "desirable_difficulty", "state_resolution"],
+          "default": null,
+          "description": "估计「作用后状态如何变化」的插件。gamma > 0 时必填。天生领域相关（技能习得与偏好漂移是不同动力学），因此是显式扩展点，不假装通用。\n\n刻意不提供名为 default 的模型：选哪一个是领域断言，没有可以默认接受的那一个。各模型的 status（exact / supported / hypothesis）见 engine/transition.py。"
+        }
+
+      }
+    },
+
+    "RewardSpec": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["peak", "increasing", "decreasing", "threshold", "constant"],
+          "description": "peak: 贴近目标成功率（学习类）\nincreasing: 越可能成功越好（偏好放大）\ndecreasing: 越可能失败越好（风险筛查）\nthreshold: 过阈值即可\nconstant: 不关心结果，只求信息增益（自适应测评）"
+        },
+        "target": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "kind = peak / threshold 时必填。"
+        },
+        "width": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "maximum": 1,
+          "default": 0.15,
+          "description": "kind = peak 时的容错带宽。"
+        },
+        "value_attr": {
+          "type": ["string", "null"],
+          "default": null,
+          "description": "作为回报倍数的 item 属性路径（单价、分值等）。把计价与配分逻辑挡在内核之外。",
+          "examples": ["attrs.price", "attrs.score"]
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "enum": ["peak", "threshold"] } }, "required": ["kind"] },
+          "then": { "required": ["target"] }
+        }
+      ]
+    },
+
+    "ValueSpec": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["mastery_sum", "neg_entropy", "info_gain"],
+          "description": "mastery_sum: 状态水平总和（追求提升）\nneg_entropy: 后验负熵（追求确定性，即自适应测评）\ninfo_gain: 预期信息增益（追求探索）"
+        },
+        "dim_weight": {
+          "enum": ["uniform", "low_mu", "high_mu", "high_var", "target"],
+          "default": "uniform",
+          "description": "关注哪些维度。low_mu = 补短板；high_mu = 强长板；high_var = 不确定优先。补短板与强长板只是此处的两种取法，不是两套算法。"
+        },
+        "target": {
+          "type": ["object", "null"],
+          "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 },
+          "description": "dim_weight = target 时必填：期望塑形到的目标画像。"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "dim_weight": { "const": "target" } }, "required": ["dim_weight"] },
+          "then": { "required": ["target"] }
+        }
+      ]
+    },
+
+    "StructureSpec": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "enum": ["diversify", "concentrate", "balanced"],
+          "description": "分散与集中是平级策略，不通过权重变号表达——负权重会破坏 Φ 的次模性，进而失去 Choose 的 (1-1/e) 近似保证。"
+        },
+        "weight": {
+          "type": "number",
+          "minimum": 0,
+          "default": 0,
+          "description": "必须非负，理由同上。"
+        },
+        "similarity": {
+          "enum": ["tag_jaccard", "tag_cosine"],
+          "default": "tag_jaccard"
+        },
+        "target_entropy": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "description": "kind = balanced 时的目标标签熵。"
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "balanced" } }, "required": ["kind"] },
+          "then": { "required": ["target_entropy"] }
+        }
+      ]
+    },
+
+    "Constraints": {
+      "type": "object",
+      "description": "可行集 F。全部为硬过滤，在召回阶段生效。任何「无论分数多高都不得返回」的规则都必须放这里；写成打分惩罚是事故的常见来源。",
+      "additionalProperties": false,
+      "properties": {
+        "predicates": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "对 item 的布尔表达式，沙箱内求值。内核不理解其业务含义。语法见 engine/predicates.py：path OP literal，无变量插值、无函数调用、无布尔连接词（多条件写成多条谓词，由调用方 AND）。租户隔离不靠谓词，靠每条 SQL 的 tenant 过滤。",
+          "examples": [["attrs.visibility != 'embargoed'", "attrs.kind in ['choice', 'blank']"]]
+        },
+        "quotas": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["group_by", "counts"],
+            "additionalProperties": false,
+            "properties": {
+              "group_by": { "type": "string", "examples": ["attrs.kind"] },
+              "counts": { "type": "object", "additionalProperties": { "type": "integer", "minimum": 0 } }
+            }
+          }
+        },
+        "max_per_tag": { "type": ["integer", "null"], "minimum": 1 },
+        "within_tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "把可行集限定在带这些 tag 之一的 item 内。空表示不限制。硬过滤，与请求体的 within.tags 是同一个字段。"
+        },
+        "exclude_item_ids": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  },
+
+
+  "examples": [
+    {
+      "id": "weak_practice_strict",
+      "label": "薄弱巩固（严格贴合难度）",
+      "extends": "practice_weak",
+      "utility": {
+        "rho": { "kind": "peak", "target": 0.72, "width": 0.08 },
+        "gamma": 0.35,
+        "value": { "kind": "mastery_sum", "dim_weight": "low_mu" },
+        "structure": { "kind": "diversify", "weight": 0.9 },
+        "explore_floor": 0.1,
+        "transition_model": "monotone_gain"
+      },
+      "constraints": {
+        "predicates": ["attrs.visibility != 'embargoed'"],
+        "quotas": [{ "group_by": "attrs.kind", "counts": { "choice": 6, "blank": 3, "essay": 1 } }],
+        "max_per_tag": 3
+      },
+      "provenance": { "status": "uncalibrated", "calibrated_at": null }
+    },
+
+    {
+      "id": "affinity_boost_gmv",
+      "label": "偏好放大（按客单价加权）",
+      "extends": "more_like_this",
+      "utility": {
+        "rho": { "kind": "increasing", "value_attr": "attrs.price" },
+        "gamma": 0,
+        "value": null,
+        "structure": { "kind": "concentrate", "weight": 0.75 },
+        "explore_floor": 0.08,
+        "transition_model": null
+      },
+      "constraints": {
+        "predicates": ["attrs.in_stock == true"],
+        "max_per_tag": 5
+      },
+      "provenance": { "status": "uncalibrated", "calibrated_at": null }
+    },
+    {
+      "id": "shape_to_target",
+      "label": "按目标画像塑形",
+      "utility": {
+        "rho": { "kind": "peak", "target": 0.65, "width": 0.15 },
+        "gamma": 0.5,
+        "value": {
+          "kind": "mastery_sum",
+          "dim_weight": "target",
+          "target": { "trig-identities": 0.8, "trig-graphs": 0.6 }
+        },
+        "structure": { "kind": "balanced", "weight": 0.4, "target_entropy": 1.2 },
+        "explore_floor": 0.1,
+        "transition_model": "monotone_gain"
+      },
+
+      "provenance": { "status": "uncalibrated", "calibrated_at": null }
+    }
+  ]
+}

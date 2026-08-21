@@ -1,0 +1,54 @@
+# Runtime configuration. Copy to adaptive.yaml, or point ADAPTIVE_CONFIG at it.
+#
+# Every key is optional; what is absent falls back to the environment variable
+# named below it, then to the default shown. The file wins over the environment,
+# because the file is the declared intent and an environment variable is whatever
+# a shell happened to be holding.
+#
+# Secrets are deliberately NOT here: ADAPTIVE_API_KEYS, ADAPTIVE_ADMIN_TOKEN and
+# ADAPTIVE_METRICS_TOKEN stay in the environment, since this file is the thing most
+# likely to end up committed.
+#
+# Inspect what a process would actually resolve:
+#   python -m engine.config            # every key
+#   python -m engine.config workers    # one key, for an entrypoint
+
+# --- storage ---------------------------------------------------------------
+# ADAPTIVE_DB. ":memory:" is supported but loses all learned state on restart and
+# forces workers to 1 (separate processes cannot share an in-memory database).
+db: adaptive.db
+
+# --- capacity --------------------------------------------------------------
+# WORKERS. Capacity comes from processes, not threads: measured 105 QPS at one
+# worker against 252 at eight, 16 concurrent clients on a 20-core host -- but the
+# eight-worker tail is much worse (client p99 256ms against 881ms), so this trades
+# predictability for volume rather than being free.
+workers: 1
+
+# ADAPTIVE_MAX_CONCURRENCY. Starlette's threadpool ceiling. Its default of 40 is
+# sized for blocking I/O; a decide is CPU-bound Python+numpy, and admitting 16 at
+# once measured 2.5x worse throughput and 2.7x worse tail than admitting 2.
+# Omit (or null) to leave the default. Per worker, so do not scale it with WORKERS.
+max_concurrency: 2
+
+# --- rate limiting ---------------------------------------------------------
+# ADAPTIVE_RATE_PER_SEC / ADAPTIVE_BURST. Per tenant AND per process, so N workers
+# multiply the real ceiling by N. Cost is charged per users x count, not per call.
+rate_per_sec: 50.0
+burst: 200.0
+
+# --- candidate generation --------------------------------------------------
+# No environment equivalents: these are the quality/latency trade-off, and they
+# belong somewhere reviewable rather than in a shell line.
+#
+# recall_limit is close to linear in latency -- 2000 / 800 / 300 measured 24 / 11 /
+# 6 ms per decide on a 3000-item catalogue. The default of 800 is where quality
+# was measured to saturate: against the untruncated catalogue (3 seeds, 120 warmed
+# users, 2 goals) it loses nothing outside 1 SE, while 300 costs 4-8% of both
+# chosen-slate utility and expected successes. Lowering it below 800 is a real
+# trade -- price it with `python -m engine.ope` and `python -m engine.eval_choose`,
+# and note that neither harness sees this knob (both take a pool directly), so a
+# change here has to be measured through `decide`.
+recall_limit: 800
+recall_tags: 12
+explore_pool_factor: 3

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+
+# Local runtime config. adaptive.example.yaml is the tracked template; the live
+# file names one machine's database path and worker count.
+adaptive.yaml
+

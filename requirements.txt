@@ -1,0 +1,12 @@
+# Runtime only. Pinned exactly, not ranged: an engine whose numbers are its
+# selling point cannot have its dependency versions float. numpy in particular
+# affects float behaviour.
+#
+# Test-only packages live in requirements-dev.txt so the image does not ship a
+# test runner and an HTTP client it never uses at runtime.
+numpy==2.5.2
+PyYAML==6.0.3
+
+# HTTP layer
+fastapi==0.115.6
+uvicorn==0.34.0

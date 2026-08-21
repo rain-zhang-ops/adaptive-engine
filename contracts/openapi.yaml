@@ -1,0 +1,1254 @@
+openapi: 3.1.0
+
+info:
+  title: Adaptive Decision API
+  version: "1.0.0"
+  summary: 给定 user 与候选池，返回在约束下最优的一组 item 及理由。
+  description: |
+    ## 设计取向
+
+    本契约**易用优先**。内核的抽象（三原语、效用泛函、(rho, gamma, V, Phi)）
+    刻意不在此出现——那是实现语言，不该出现在任何客户能看到的地方。
+
+    ## 四层渐进披露
+
+    ```
+    L0  { user, count }                            零配置
+    L1  + goal                                     选意图（90% 客户停在这里）
+    L2  + tune { difficulty, focus, freshness }     形容词旋钮
+    L3  + policy_ref                               逃生舱，完整表达力
+    ```
+
+    L3 的 policy 先经 `POST /v1/policies` 注册（注册时即用与内置目录相同的规则
+    校验，坏 policy 当场拒绝而非等到第一次引用），再由 `next` 用 `policy_ref` 引用。
+
+    ## 三条不可让空的约定
+
+    1. **接入无前置建模**。`tags` 可完全不提供，引擎退化为单维模型照样工作；
+       `item` / `tag` 首次出现即自动注册，无需预先导入体系。
+    2. **结果自解释**。`why` 是给终端用户看的人话，可直接渲染到 UI；降级时
+       另给 `hint`，说明该怎么办。语言由 `locale` 决定（缺失走服务端默认）。
+    3. **失败要软**。数据不足 / user 未知 / 候选为空一律 200 + `confidence: "low"`
+       + `fallback_reason`，永不抛 5xx。引擎报错等于客户的线上故障。
+
+    ## 闭环：只需回传 decision_id
+
+    `/v1/next` 每个 user 的结果带一个 `decision_id`。上报反馈时带上它，服务端
+    自己查出每个 item 的 `propensity`——`propensity` 是响应里唯一事后无法重建的
+    数字，让客户自行保管是最易丢且丢了纠偏就废的一环。
+
+    ## 词汇
+
+    仅四个名词：`user` · `item` · `tag` · `signal`，状态叫 `profile`。
+    客户的业务模型通过 adapter 映射进来。
+
+    ## 错误信封
+
+    所有 4xx 同一形状：`{ error, detail }`，422 另带 `problems`（每行一条可读
+    的字段级问题）。`detail` 面向人写，含 "did you mean ...?" 这类近义提示。
+
+servers:
+  - url: https://api.example.com
+    description: SaaS
+  - url: http://localhost:8080
+    description: 私有化 / 本地
+
+security:
+  - ApiKeyAuth: []
+
+tags:
+  - name: decide
+    description: 取决策结果
+  - name: ingest
+    description: 上报反馈 / 登记目录
+  - name: profile
+    description: 查看状态与数据权利
+  - name: policies
+    description: L3 自定义策略
+  - name: ops
+    description: 健康检查与运维
+
+paths:
+
+  /v1/next:
+    post:
+      operationId: next
+      tags: [decide]
+      summary: 取下一组 item
+      description: |
+        L0 最小调用只需 `user` 与 `count`：
+
+        ```json
+        { "user": "u_123", "count": 10 }
+        ```
+
+        引擎按租户默认 goal 处理并返回可用结果。`user` 与 `users` 二选一；
+        `goal` 与 `policy_ref` 二选一（同时给出返回 422，因为审计行无法确定
+        是哪一个产生了决策）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/NextRequest" }
+            examples:
+              L0_zero_config:
+                summary: L0 零配置
+                value: { user: "u_123", count: 10 }
+              L1_goal:
+                summary: L1 选意图
+                value: { user: "u_123", count: 10, goal: practice_weak }
+              L2_tuned:
+                summary: L2 形容词旋钮
+                value:
+                  user: "u_123"
+                  count: 10
+                  goal: practice_weak
+                  tune: { difficulty: moderate, focus: broad, freshness: 0.2 }
+                  within: { tags: ["trig-identities"] }
+                  locale: en
+              L3_escape_hatch:
+                summary: L3 逃生舱（先注册后引用）
+                value: { user: "u_123", count: 10, policy_ref: "my_policy_v3" }
+              batch:
+                summary: 批量（整班/整组一次算完）
+                value:
+                  users: ["u_1", "u_2", "u_3"]
+                  count: 10
+                  goal: practice_weak
+      responses:
+        "200":
+          description: |
+            始终返回 200。降级时通过 `confidence` 与 `fallback_reason` 告知，
+            并给 `hint` 说明下一步，而非抛错。
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/NextResponse" }
+              examples:
+                ok:
+                  summary: 正常
+                  value:
+                    confidence: high
+                    fallback_reason: null
+                    hint: null
+                    results:
+                      - user: "u_123"
+                        decision_id: "b3f1c2a4d5e6"
+                        confidence: high
+                        fallback_reason: null
+                        hint: null
+                        recall: { strategy: full_catalogue, scanned: 340, catalogue: 340, truncated: false }
+                        items:
+                          - id: "it_881"
+                            why: "与当前水平最匹配（预计成功率 68%）"
+                            expected_success: 0.68
+                            propensity: 0.12
+                    meta:
+                      policy_id: practice_weak
+                      policy_ref: null
+                      model_version: "mtor-2026.08"
+                      goal: practice_weak
+                      degraded_users: 0
+                      fallback_reasons: []
+                degraded:
+                  summary: 降级（新 user，无历史）
+                  value:
+                    confidence: medium
+                    fallback_reason: cold_start_no_signals
+                    hint: "该用户还没有历史记录，结果来自先验而非证据。照常使用即可……"
+                    results:
+                      - user: "u_new"
+                        decision_id: "9a8b7c6d5e4f"
+                        confidence: medium
+                        fallback_reason: cold_start_no_signals
+                        hint: "该用户还没有历史记录，结果来自先验而非证据。照常使用即可……"
+                        recall: { strategy: full_catalogue, scanned: 340, catalogue: 340, truncated: false }
+                        items:
+                          - id: "it_120"
+                            why: "与当前水平最匹配（预计成功率 50%）"
+                            expected_success: 0.5
+                            propensity: 0.10
+                    meta:
+                      policy_id: practice_weak
+                      model_version: "mtor-2026.08"
+                      degraded_users: 1
+                      fallback_reasons: [cold_start_no_signals]
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/decisions/{decision_id}:
+    get:
+      operationId: getDecision
+      tags: [decide]
+      summary: 回放一次决策
+      description: |
+        返回当时服务出去的全部内容，含每个 item 的 `propensity`、`policy_id`
+        与 `model_ver`。存在的意义就是让客户不必自己保存这些——闭环只需回传
+        `decision_id`。
+      parameters:
+        - name: decision_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DecisionRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/signals:
+    post:
+      operationId: logSignals
+      tags: [ingest]
+      summary: 批量上报反馈
+      description: |
+        必填仅 `user` `item` `outcome`。
+
+        - `item` 首次出现即自动注册，不要求预先导入体系
+        - `outcome` 是 [0,1] 连续值，同时覆盖对错、得分率、完成度
+        - `ts` **可选**，省略即「现在」（epoch 秒）。给出毫秒（> 1e11）会在
+          `warnings` 里提醒——单位错误会悄悄扭曲基于时间的不确定性增长
+        - `signal_id` 是幂等键，缺失时重投会被重复计数，故其缺失也在 `warnings`
+          里回报
+        - `propensity` 与 `decision_id` 二选一即可闭环：给 `decision_id`，服务端
+          查出 propensity 并计入 `backfilled_propensity`；两者都无则计入
+          `missing_propensity`（仍训练模型，但无法用于离线纠偏）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [signals]
+              properties:
+                signals:
+                  type: array
+                  minItems: 1
+                  maxItems: 5000
+                  items: { $ref: "#/components/schemas/Signal" }
+            examples:
+              close_the_loop:
+                summary: 只回传 decision_id（推荐）
+                value:
+                  signals:
+                    - user: "u_123"
+                      item: "it_881"
+                      outcome: 1
+                      decision_id: "b3f1c2a4d5e6"
+                      signal_id: "b3f1c2a4d5e6:it_881"
+              explicit_propensity:
+                summary: 直接回传 propensity
+                value:
+                  signals:
+                    - user: "u_123"
+                      item: "it_907"
+                      outcome: 0.6
+                      ts: 1787275916.5
+                      propensity: 0.12
+                      signal_id: "sess42:it_907"
+                      context: { seconds_spent: 210, device: pad }
+      responses:
+        "200":
+          description: 已处理（幂等：重投计入 duplicates，不改状态）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SignalsResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/items:
+    post:
+      operationId: upsertItems
+      tags: [ingest]
+      summary: 登记 / 更新 item 元数据（可选）
+      description: |
+        **完全可选**。不调用也能工作——item 会在首次出现于 signal 或候选池时
+        自动注册。提供元数据的收益：`tags` 让状态估计细化到维度级；
+        `difficulty_prior` 让新 item 在零曝光时也能拿到合理预测。
+
+        返回 created/updated 计数，使重复推送可审计（确认是新建还是覆盖）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [items]
+              properties:
+                items:
+                  type: array
+                  minItems: 1
+                  maxItems: 5000
+                  items: { $ref: "#/components/schemas/ItemUpsert" }
+      responses:
+        "200":
+          description: 已更新
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  total: { type: integer, description: 本次提交的 item 数 }
+                  created: { type: integer }
+                  updated: { type: integer }
+                  tags: { type: integer, description: 当前租户标签维度总数 }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    get:
+      operationId: listItems
+      tags: [ingest]
+      summary: 读回目录
+      description: |
+        登记是只写路径；此接口让客户确认到底登记了什么、tag 如何解析、有没有
+        id 撞车覆盖。keyset 游标分页而非 OFFSET，边写边翻页也不会跳行或重复。
+      parameters:
+        - name: after
+          in: query
+          description: 游标：上一页最后一个 item_id
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, default: 200, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: 一页目录 + 游标
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/ItemRecord" }
+                  count: { type: integer }
+                  total: { type: integer }
+                  next_after:
+                    type: string
+                    nullable: true
+                    description: 下一页游标；为 null 表示已到末页。
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/items/{item_id}:
+    get:
+      operationId: getItem
+      tags: [ingest]
+      summary: 取单个 item
+      parameters:
+        - name: item_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ItemRecord" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/policies:
+    post:
+      operationId: putPolicy
+      tags: [policies]
+      summary: 注册 / 更新一份 L3 策略
+      description: |
+        用与内置目录相同的规则在**注册时**校验，坏 policy 当场（有人盯着时）拒绝，
+        而非等到第一次引用它的请求。例如负的 structure.weight 会破坏 (1-1/e)
+        近似保证，在此被拒。缺 `provenance.status` 会在 `warnings` 里提醒
+        （其常数按未校准对待）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PolicyDoc" }
+            examples:
+              extends:
+                summary: 继承内置目标再覆盖
+                value:
+                  id: "night-drill"
+                  label: "夜间集训"
+                  extends: practice_weak
+                  utility: { rho: { kind: peak, target: 0.62 }, explore_floor: 0.10 }
+                  constraints: { max_per_tag: 2 }
+      responses:
+        "200":
+          description: 已注册
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policy_ref: { type: string }
+                  warnings:
+                    type: array
+                    items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    get:
+      operationId: listPolicies
+      tags: [policies]
+      summary: 列出本租户已注册的策略
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policies:
+                    type: array
+                    items: { $ref: "#/components/schemas/PolicySummary" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/policies/{policy_ref}:
+    get:
+      operationId: getPolicy
+      tags: [policies]
+      summary: 取一份策略（含原始文档）
+      parameters:
+        - name: policy_ref
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  policy_ref: { type: string }
+                  label: { type: string, nullable: true }
+                  doc: { type: object, additionalProperties: true }
+                  created_at: { type: number }
+                  updated_at: { type: number }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      operationId: deletePolicy
+      tags: [policies]
+      summary: 删除一份策略
+      parameters:
+        - name: policy_ref
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/profile/{user}:
+    get:
+      operationId: getProfile
+      tags: [profile]
+      summary: 查看 user 当前状态
+      description: |
+        返回各 tag 上的把握度（`level` = sigmoid(mu)，0..1）与置信度
+        （`confidence`，随方差上升而下降）。不暴露内部 logit，避免其尺度
+        意外变成对外契约的一部分。降级时给 `hint`。
+      parameters:
+        - name: user
+          in: path
+          required: true
+          schema: { type: string }
+        - name: locale
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: "OK（未知 user 也返回 200，`known: false`）"
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Profile" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      operationId: deleteProfile
+      tags: [profile]
+      summary: 抹除某 user 的记录（被遗忘权）
+      description: |
+        item 侧参数（难度、区分度）是群体统计量，不含个人数据、无法归因到个人，
+        因此不回退——这一点写在响应里而非埋在变更日志，因为「抹除记录」与
+        「撤销贡献」的区别正是合规评审会问的。
+      parameters:
+        - name: user
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 已抹除
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted: { type: object, additionalProperties: true }
+                  note: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/profile/{user}/export:
+    get:
+      operationId: exportProfile
+      tags: [profile]
+      summary: 导出某 user 的全部数据（数据访问权）
+      parameters:
+        - name: user
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 该 user 名下的 signals 与 decisions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  signals: { type: array, items: { type: object, additionalProperties: true } }
+                  decisions: { type: array, items: { type: object, additionalProperties: true } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/goals:
+    get:
+      operationId: listGoals
+      tags: [decide]
+      summary: 自描述：有哪些 goal、每个 tune 旋钮的取值、可用 locale 与 policy
+      description: |
+        让调用方查得到词汇，而不是靠猜然后吃 400。`calibrated` 明确标出常数
+        是否已校准。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  default: { type: string }
+                  calibrated: { type: boolean }
+                  goals:
+                    type: object
+                    additionalProperties: { type: object, additionalProperties: true }
+                  tune:
+                    type: object
+                    additionalProperties: { type: array, items: { type: string } }
+                  locales:
+                    type: array
+                    items: { type: string }
+                  policies:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /v1/admin/purge:
+    post:
+      operationId: purge
+      tags: [ops]
+      summary: 按 TTL 清理历史（predictions / signals / decisions）
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                prediction_ttl_days: { type: number, default: 30, minimum: 0 }
+                signal_ttl_days: { type: number, default: 400, minimum: 0 }
+                decision_ttl_days: { type: number, default: 90, minimum: 0 }
+                dry_run:
+                  type: boolean
+                  default: false
+                  description: |
+                    只统计将被删除的行数而不删除。purge 不可逆且会带走审计轨迹，
+                    所以要能先看清爆炸半径再动手。
+      responses:
+        "200":
+          description: "各表删除行数（`dry_run: true` 时是将被删除的行数）"
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: object
+                    properties:
+                      predictions: { type: integer }
+                      decisions: { type: integer }
+                      signals: { type: integer }
+                  dry_run:
+                    type: boolean
+                    description: 本次调用是否只做统计而未真正删除。
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /healthz:
+    get:
+      operationId: healthz
+      tags: [ops]
+      summary: 存活探针（不触库）
+      description: 只回答「进程还在」，刻意不查数据库——查了的话一个慢查询会害得
+        pod 被杀而非仅标记不可用。无需鉴权。
+      security: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean }
+                  model_version: { type: string }
+                  schema_version: { type: integer }
+
+  /readyz:
+    get:
+      operationId: readyz
+      tags: [ops]
+      summary: 就绪探针（查库）
+      description: 回答「能否服务」，真的去 ping 依赖。不通返回 503（降级而非崩溃）。
+      security: []
+      responses:
+        "200":
+          description: 就绪
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean }
+                  schema_version: { type: integer }
+        "503":
+          description: 未就绪（依赖不可达）
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ready: { type: boolean }
+                  error: { type: string }
+
+  /metrics:
+    get:
+      operationId: metricsOpenMetrics
+      tags: [ops]
+      summary: OpenMetrics 文本（Prometheus 抓取）
+      description: |
+        文本曝露，Prometheus 可直接抓。两点如实说明：数字是**每进程**的，N 个
+        副本给出 N 份局部视图，在线校准窗口也被分摊；抓取需鉴权（配置了 bearer
+        token 就用它，否则用 API key），因为按租户计数属于租户信息。
+      parameters:
+        - name: Authorization
+          in: header
+          required: false
+          schema: { type: string }
+          description: 配置了抓取 token 时用 `Bearer <token>`。
+      responses:
+        "200":
+          description: OpenMetrics 文本（以 `# EOF` 结尾）
+          content:
+            text/plain:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /metrics.json:
+    get:
+      operationId: metricsJson
+      tags: [ops]
+      summary: 指标快照（保留可靠性分箱表）
+      description: 与 /metrics 同源，但保留 per-bin 明细——那才说明校准是**如何**
+        漂移的，扁平的 OpenMetrics 形状放不下。
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { type: object, additionalProperties: true }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+
+  schemas:
+
+    NextRequest:
+      type: object
+      description: |
+        `user` 与 `users` 二选一；`goal` 与 `policy_ref` 二选一。其余字段全部
+        可选——这是 L0 可跑的前提。
+      properties:
+        user: { type: string, description: 单个 user }
+        users:
+          type: array
+          items: { type: string }
+          maxItems: 500
+          description: 批量。整组一次算完，比逐个调用显著更快。
+        count:
+          type: integer
+          minimum: 1
+          maximum: 200
+          default: 10
+        goal: { $ref: "#/components/schemas/Goal" }
+        policy_ref:
+          type: string
+          description: |
+            **L3 逃生舱**。引用一份经 `POST /v1/policies` 注册的自定义 policy。
+            与 `goal` 互斥。
+        tune: { $ref: "#/components/schemas/Tune" }
+        within: { $ref: "#/components/schemas/Within" }
+        exclude: { $ref: "#/components/schemas/Exclude" }
+        quota:
+          type: array
+          description: 按属性分组的数量要求（如各题型配比）。
+          items:
+            type: object
+            required: [group_by, counts]
+            properties:
+              group_by: { type: string, example: "attrs.kind" }
+              counts:
+                type: object
+                additionalProperties: { type: integer }
+                example: { choice: 6, blank: 3, essay: 1 }
+        explain:
+          type: boolean
+          default: true
+          description: 关闭可略微降低延迟；一般不建议关。
+        locale:
+          type: string
+          description: |
+            `why` 与 `hint` 的语言（如 `zh` / `en` / `zh-CN`）。不支持的 locale
+            回退到服务端默认，再回退到 why.yaml 的默认，而非报错。
+      oneOf:
+        - required: [user]
+        - required: [users]
+
+    Goal:
+      type: string
+      description: |
+        业务意图，不是算法名。默认见 `GET /v1/goals`。具体可用值随 goals.yaml
+        而定，请以 `/v1/goals` 为准而非硬编码此处。
+      example: practice_weak
+
+    Tune:
+      type: object
+      description: |
+        形容词与百分比，不含任何数学符号。未给出的项使用所选 goal 的默认值。
+        取值集合以 `GET /v1/goals` 的 `tune` 为准。写错的值会得到 400 + 近义
+        提示；写错的**键**（如 `freshnes`）同样得到 400 而非被静默丢弃。
+      properties:
+        difficulty:
+          type: string
+          description: 期望的挑战程度（如 easy / moderate / hard / brutal）。
+        focus:
+          type: string
+          description: 结果集集中还是分散（如 narrow / balanced / broad）。
+        freshness:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 结果中「没见过 / 不确定」的比例。过低会让推荐越来越窄。
+        stakes:
+          type: string
+          description: 容错带宽（如 low / normal / high）。
+      additionalProperties: true
+
+    Within:
+      type: object
+      description: 候选范围限定。
+      properties:
+        tags:
+          type: array
+          items: { type: string }
+          description: |
+            把候选池限定在带这些 tag 之一的 item 内，是硬过滤。生效时
+            `meta.recall.strategy` 会是 `within_tags`。
+        attrs:
+          type: object
+          additionalProperties: true
+          description: '属性等值过滤，如 `{ "kind": "choice" }`。'
+        item_ids:
+          type: array
+          items: { type: string }
+          description: |
+            直接指定召回池。它只决定从哪些 item 里召回，**不**忽略其他范围条件：
+            `within.tags` 与 `within.attrs` 仍作为硬过滤在此召回池之上叠加生效。
+      additionalProperties: false
+
+    Exclude:
+      type: object
+      description: |
+        硬排除。任何「无论分数多高都不能返回」的规则都应放在这里，
+        而不是靠打分压低——后者是出事故的常见原因。
+      properties:
+        item_ids:
+          type: array
+          items: { type: string }
+        attrs:
+          type: object
+          additionalProperties: true
+          description: '属性排除，如 `{ "visibility": "embargoed" }`。'
+        max_per_tag:
+          type: integer
+          minimum: 1
+          description: 同一 tag 最多出现几次，防止结果扎堆。
+      additionalProperties: false
+
+    NextResponse:
+      type: object
+      required: [confidence, results]
+      properties:
+        confidence:
+          type: string
+          enum: [high, medium, low]
+          description: |
+            本批结果的可信程度，取**批内最差的那一个**。非 high 意味着至少有一个
+            user 已降级。要知道是哪个 user，读 `results[].confidence`。
+        fallback_reason:
+          type: string
+          nullable: true
+          enum:
+            - null
+            - cold_start_no_signals
+            - insufficient_candidates
+            - empty_candidate_pool
+            - constraints_unsatisfiable
+            - no_taxonomy_registered
+          description: |
+            仅在降级时出现，取**批内第一个非空的原因**，仅作汇总——它无法定位到
+            具体是哪个 user 降级了，定位请读 `results[].fallback_reason`，本批出现
+            过的全部原因见 `meta.fallback_reasons`。
+            刻意分开：`empty_candidate_pool` = 目录里没有候选；
+            `insufficient_candidates` = 有候选但不足 count 个；
+            `constraints_unsatisfiable` = 候选够但约束（quota / 过滤）无解。
+            合并成一个会让排查方向完全跑偏。
+        hint:
+          type: string
+          nullable: true
+          description: |
+            降级时「该怎么办」的一句话（受 `locale` 影响）。high 时为 null。
+            只返回原因而不给下一步，会让调用方在重试 / 等待 / 改请求之间干瞪眼。
+        results:
+          type: array
+          items:
+            type: object
+            description: |
+              一个 user 的决策结果。`confidence` / `fallback_reason` / `hint` /
+              `recall` 都是**逐用户**的：批量请求里顶层的 `confidence` /
+              `fallback_reason` 只是汇总（最差值 / 第一个非空原因），无法定位到
+              具体是哪个用户降级，所以要按 user 排查就读这里。
+            required: [user, decision_id, items]
+            properties:
+              user: { type: string }
+              decision_id:
+                type: string
+                description: |
+                  本次决策的句柄。上报反馈时带上它即可闭环——服务端已存有每个
+                  item 的 propensity，客户无需自留那个事后无法重建的数字。
+              confidence:
+                type: string
+                enum: [high, medium, low]
+                description: 该 user 这一条决策自己的置信度，与顶层汇总值无关。
+              fallback_reason:
+                type: string
+                nullable: true
+                description: 该 user 自己的降级原因；未降级为 null。
+              hint:
+                type: string
+                nullable: true
+                description: |
+                  该 user 的下一步建议（受 `locale` 影响）。`confidence` 为 high
+                  时为 null。
+              recall:
+                allOf:
+                  - $ref: "#/components/schemas/Recall"
+                description: 该 user 的召回诊断，与 `meta.recall` 同结构。
+              items:
+                type: array
+                items: { $ref: "#/components/schemas/ChosenItem" }
+        meta:
+          type: object
+          properties:
+            policy_id:
+              type: string
+              description: 审计用策略标识。L0/L1/L2 为 goal+tune 的内容哈希，L3 即 policy_ref。
+            policy_ref: { type: string, nullable: true }
+            goal: { type: string, nullable: true }
+            model_version: { type: string }
+            applied_tune: { type: object, additionalProperties: true }
+            notes:
+              type: array
+              items: { type: string }
+              description: 被接受但无实际效果的 tune 键等提示。
+            warnings:
+              type: array
+              items: { type: string }
+            recall:
+              allOf:
+                - $ref: "#/components/schemas/Recall"
+              description: |
+                候选池是怎么构建的（策略、是否被截断），供「为什么没考虑 X」排查。
+                批量时这是**第一个 user** 的；逐用户的在 `results[].recall`。
+            degraded_users:
+              type: integer
+              description: 本批里有多少个 user 降级了。
+            fallback_reasons:
+              type: array
+              items: { type: string }
+              description: 本批出现过的所有不同降级原因（去重后排序）。
+            latency_ms: { type: integer }
+
+    Recall:
+      type: object
+      description: |
+        候选池诊断：用哪条召回路径、扫了多少、是否被预算截断。存在的意义是让
+        「为什么没考虑 item X」有答案，也让被截断的目录可见而非无声。
+      properties:
+        strategy:
+          type: string
+          enum: [full_catalogue, tag_index+coverage, explicit_ids, within_tags]
+          description: |
+            走的哪条召回路径。`full_catalogue` = 目录小于召回预算，全量入池；
+            `tag_index+coverage` = 目录超预算，按目标 tag 取一片 + 覆盖抽样一片；
+            `explicit_ids` = 调用方用 `within.item_ids` 直接指定了召回池；
+            `within_tags` = 请求给了 `within.tags`，只从 tag 索引里召回。
+        scanned: { type: integer, description: 实际进入打分的候选数。 }
+        catalogue: { type: integer, description: 本租户目录里的 item 总数。 }
+        truncated:
+          type: boolean
+          description: 候选池是否因召回预算被截断（截断意味着最优解可能不在池里）。
+        objective: { type: integer, description: 仅 `tag_index+coverage`：目标 tag 片的候选数。 }
+        coverage: { type: integer, description: 仅 `tag_index+coverage`：覆盖抽样片的候选数。 }
+        duplicates_dropped:
+          type: integer
+          description: |
+            仅 `tag_index+coverage`：两片独立抽取后重复、被去重丢弃的候选数。
+        tags:
+          type: array
+          items: { type: string }
+          description: 召回所用的 tag（最多前 8 个）。
+      additionalProperties: true
+
+    ChosenItem:
+      type: object
+      required: [id, propensity]
+      properties:
+        id: { type: string }
+        why:
+          type: string
+          description: |
+            给终端用户看的人话，可直接渲染到 UI，语言随 `locale`。
+            不是内部分数字典——把机器可读的贡献度翻译成句子是本层的职责。
+          example: "与当前水平最匹配（预计成功率 68%）"
+        expected_success:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 预测成功率。数据稀薄时自动向 0.5 收缩，不会给出过度自信的值。
+        propensity:
+          type: number
+          description: |
+            本 item 在当前策略下被选中的边际概率。上报该 item 的 signal 时
+            原样回传，或改回传 `decision_id` 让服务端代查——这是日后纠偏的唯一凭据。
+        detail:
+          type: object
+          description: |
+            机器可读的贡献分解，`explain=true` 时返回，供调试与 A/B 归因。五个键：
+            - `fit`：该 item 与 user 当前水平的匹配效用（越高越贴合目标）。
+            - `structure`：结构项贡献（同批多样性 / 覆盖等的边际影响，可能为负）。
+            - `sigma`：该 item 后验不确定性，探索抽样按它排序。
+            - `explore`：本 item 是否来自探索名额，1.0 是、0.0 否。
+            - `propensity_exact`：`propensity` 是否为解析精确值。1.0 = 精确；
+              0.0 = 近似（quota / max_per_tag 扰动了探索抽样，使名额概率无法解析
+              精确算出）。做 IPS 的调用方必须先读它，再决定是否信任该权重。
+          additionalProperties: { type: number }
+          example: { fit: 0.82, structure: -0.05, sigma: 0.31, explore: 0.0, propensity_exact: 1.0 }
+
+    Signal:
+      type: object
+      description: |
+        一条上报的反馈。`additionalProperties: false` 是硬约束：未知字段会被 422
+        拒绝而不是静默丢弃——被丢掉的往往正是 `propensity` 这种事后无法重建的字段，
+        写错成 `propensty` 却拿到 200 是三种处理里最坏的一种。
+      required: [user, item, outcome]
+      properties:
+        user: { type: string }
+        item: { type: string }
+        outcome:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: |
+            [0,1] 连续值。二元对错用 0/1；部分得分、完成度直接给比例。
+        ts:
+          type: number
+          description: |
+            事件时间，**epoch 秒**。可选，省略即「现在」。给出 > 1e11 会被当作
+            毫秒并在 warnings 里提醒。
+        signal_id:
+          type: string
+          description: 幂等键。缺失时重投会被重复计数，其缺失会在 warnings 里回报。
+        decision_id:
+          type: string
+          description: |
+            该反馈回应的决策。给出后服务端据此查 propensity，客户便无需自留
+            per-item propensity 表。
+        propensity:
+          type: number
+          nullable: true
+          exclusiveMinimum: 0
+          maximum: 1
+          description: |
+            若该 item 来自本引擎且未给 decision_id，请回传 `/v1/next` 给出的值。
+            必须 **> 0**：0 意味着「不可能被选中」，作为 IPS 纠偏权重的分母无意义，
+            给 0 会被 422 拒绝。
+        policy_id: { type: string, nullable: true }
+        context:
+          type: object
+          additionalProperties: true
+          description: 自由附加信息（耗时、设备、场次），引擎不解释其含义。
+      additionalProperties: false
+
+    SignalsResponse:
+      type: object
+      properties:
+        accepted: { type: integer }
+        duplicates: { type: integer, description: 因 signal_id 命中而被忽略的重投 }
+        unknown_items: { type: integer, description: 引用了不存在 item 的信号数 }
+        backfilled_propensity:
+          type: integer
+          description: 无 propensity 但凭 decision_id 查到并补上的信号数。
+        missing_propensity:
+          type: integer
+          description: 既无 propensity 又无可解析 decision_id 的信号数（仍训练，但无法纠偏）。
+        warnings:
+          type: array
+          items: { type: string }
+          description: 缺 signal_id、疑似毫秒 ts、缺 propensity 等可读提示。
+
+    ItemUpsert:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+        tags:
+          type: object
+          additionalProperties: { type: number }
+          description: |
+            tag -> 权重，建议和为 1。**可以完全省略**，省略时该 item 归入单一
+            隐维度，引擎仍能工作。
+          example: { "trig-identities": 0.7, "algebra-basics": 0.3 }
+        difficulty_prior:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 内容侧难度先验，供零曝光阶段使用，随曝光累积逐步让位于观测。
+        attrs:
+          type: object
+          additionalProperties: true
+          description: 供 `within` / `exclude` / `quota` 引用的开放属性。
+
+    ItemRecord:
+      type: object
+      properties:
+        id: { type: string }
+        tags:
+          type: object
+          additionalProperties: { type: number }
+        difficulty_prior: { type: number, nullable: true }
+        attrs: { type: object, additionalProperties: true }
+
+    DecisionRecord:
+      type: object
+      properties:
+        decision_id: { type: string }
+        user_id: { type: string }
+        goal: { type: string }
+        policy_id: { type: string }
+        model_ver: { type: string }
+        confidence: { type: string, enum: [high, medium, low] }
+        created_at: { type: number }
+        payload:
+          type: object
+          description: 服务出去的完整内容。
+          properties:
+            confidence: { type: string }
+            fallback_reason: { type: string, nullable: true }
+            recall: { type: object, additionalProperties: true }
+            chosen:
+              type: array
+              items:
+                type: object
+                properties:
+                  item_id: { type: string }
+                  utility: { type: number }
+                  p_hat: { type: number }
+                  propensity: { type: number }
+                  reasons:
+                    type: object
+                    additionalProperties: { type: number }
+                    description: |
+                      与 `ChosenItem.detail` 同一组键：`fit`、`structure`、`sigma`、
+                      `explore`、`propensity_exact`。
+                    example: { fit: 0.82, structure: -0.05, sigma: 0.31, explore: 0.0, propensity_exact: 1.0 }
+
+    PolicyDoc:
+      type: object
+      description: |
+        L3 策略文档。真正执行校验的是 engine/policy.py 的装载期规则；
+        policy.schema.json 描述同一张面但不被任何代码读取，只作参考。
+        此处只列 HTTP 层强校验的字段，未知键透传给策略层以便带原因拒绝。
+      required: [id]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9_-]{2,63}$"
+        label: { type: string }
+        extends:
+          type: string
+          description: 覆盖在某内置 goal 之上；继承意味着基目标日后变更会被带上，而非冻结成副本。
+        utility:
+          type: object
+          additionalProperties: true
+          description: (rho, gamma, value, structure, explore_floor, transition_model)。
+        constraints:
+          type: object
+          additionalProperties: true
+          description: L3 下可行集是策略的一部分；`exclude_seen_within_days` 已在 schema 但未实现，给出会被拒。
+        provenance:
+          type: object
+          additionalProperties: true
+          description: 缺 `status` 会告警，其常数按未校准对待。
+      additionalProperties: true
+
+    PolicySummary:
+      type: object
+      properties:
+        policy_ref: { type: string }
+        label: { type: string, nullable: true }
+        created_at: { type: number }
+        updated_at: { type: number }
+
+    Profile:
+      type: object
+      properties:
+        user_id: { type: string }
+        known: { type: boolean }
+        model_version: { type: string }
+        fallback_reason: { type: string, nullable: true }
+        hint: { type: string, nullable: true }
+        weakest:
+          type: array
+          items: { $ref: "#/components/schemas/ProfileDim" }
+        strongest:
+          type: array
+          items: { $ref: "#/components/schemas/ProfileDim" }
+
+    ProfileDim:
+      type: object
+      properties:
+        tag: { type: string }
+        level:
+          type: number
+          description: 当前把握度 / 亲和度，0..1（sigmoid(mu)）。
+        confidence:
+          type: number
+          description: 该维度估计的可信度，0..1。久未观测会下降。
+
+    Error:
+      type: object
+      required: [error, detail]
+      properties:
+        error:
+          type: string
+          description: 错误类别，如 `policy` / `validation`。
+        detail:
+          type: string
+          description: 面向人写的说明，含 "did you mean ...?" 之类近义提示。
+        problems:
+          type: array
+          items: { type: string }
+          description: 仅 422：每行一条字段级问题。
+
+  responses:
+    BadRequest:
+      description: |
+        仅用于请求本身不合法（坏 goal / tune 值、policy 校验失败）。
+        数据不足一类情形不走这里，走 200 + `confidence: low`。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: |
+        API Key 无效或缺失。与其他 4xx 同一信封：响应体一定带 `error` 与 `detail`。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: |
+        已认证但无权执行该操作。目前只用于 `POST /v1/admin/purge`：配置了 operator
+        token（环境变量 `ADAPTIVE_ADMIN_TOKEN`）时，purge 必须在
+        `Authorization: Bearer <token>` 里带上它，否则 403——租户 key 本身不足以
+        删掉该租户的整条审计轨迹。与其他 4xx 同一信封，带 `error` 与 `detail`。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: |
+        未找到。与其他 4xx 同一信封：响应体一定带 `error` 与 `detail`。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    ValidationError:
+      description: |
+        Schema 层拒绝（字段缺失 / 类型错 / 互斥字段同时给出）。与其他 4xx 同一
+        信封，另带 `problems`。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: |
+        超出配额。两种来源：租户令牌桶超限（批量请求按 users x count 计费，故一次
+        大批量可能单独触发），以及认证失败过多时按来源限流。与其他 4xx 同一信封：
+        响应体一定带 `error` 与 `detail`。
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
