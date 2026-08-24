@@ -15,6 +15,8 @@ those has a failure mode that only shows up over HTTP:
 
 from __future__ import annotations
 
+import sqlite3
+import time
 from pathlib import Path
 
 import pytest
@@ -168,6 +170,22 @@ def test_concurrency_cap_is_validated_before_serving(tmp_path, monkeypatch):
     monkeypatch.setenv("ADAPTIVE_MAX_CONCURRENCY", "lots")
     with pytest.raises(ConfigError):
         app()
+
+
+def test_store_connections_are_released_on_shutdown(tmp_path):
+    """Every request-handling thread opens its own SQLite connection; lifespan
+    shutdown is the only place that can release them all. This inspects the
+    store's connection list directly -- from the outside, a leaked connection
+    is invisible until the file descriptors run out."""
+    store = SqliteStore(tmp_path / "life.db")
+    keys = ApiKeyRegistry()
+    keys.add(KEY_A, "tenantA")
+    app = create_app(store=store, keys=keys,
+                     limiter=RateLimiter(rate_per_sec=1e6, burst=1e6))
+    with TestClient(app) as c:                     # `with` runs lifespan
+        assert c.get("/v1/goals", headers=_hdr()).status_code == 200
+        assert store._all_cons                     # the request opened one
+    assert store._all_cons == []
 
 
 
@@ -717,3 +735,140 @@ def test_openapi_yaml_describes_exactly_the_routes_that_exist(client):
         f"undocumented routes: {sorted(implemented - documented)}"
     assert documented - implemented == set(), \
         f"documented but absent: {sorted(documented - implemented)}"
+
+
+# ---------------------------------------------------------------------------
+# retention: /v1/admin/purge -- the only irreversible endpoint
+# ---------------------------------------------------------------------------
+
+
+def _history_client(tmp_path, monkeypatch, admin_token=None):
+    """An app with a database at a known path, so tests can inspect and age
+    the rows directly. The admin token is read from the environment at app
+    construction, so it must be set before ``create_app``."""
+    if admin_token is not None:
+        monkeypatch.setenv("ADAPTIVE_ADMIN_TOKEN", admin_token)
+    keys = ApiKeyRegistry()
+    keys.add(KEY_A, "tenantA")
+    keys.add(KEY_B, "tenantB")
+    db = tmp_path / "purge.db"
+    app = create_app(store=SqliteStore(db), keys=keys,
+                     limiter=RateLimiter(rate_per_sec=1e6, burst=1e6))
+    return TestClient(app), db
+
+
+def _seed_history(client, sim, key=KEY_A):
+    """One decision with its predictions, plus the signals that close the loop --
+    a row in each of the three tables purge is responsible for. Signals cover
+    only part of the slate: a prediction matched to its outcome is consumed for
+    calibration and leaves the table, so reporting every item would leave the
+    predictions table empty and give purge nothing to bound."""
+    _load(client, sim, key=key)
+    served = client.post("/v1/next", json={"user": "u1", "count": 5},
+                         headers=_hdr(key)).json()
+    items = served["results"][0]["items"]
+    r = client.post("/v1/signals", json={"signals": [
+        {"user": "u1", "item": i["id"], "outcome": 1.0, "ts": 50.0 + n,
+         "signal_id": f"pg-{key}-{n}", "propensity": i["propensity"]}
+        for n, i in enumerate(items[:2])]}, headers=_hdr(key))
+    assert r.status_code == 200, r.text
+
+
+def _sql(db, stmt, args=()):
+    con = sqlite3.connect(db)
+    try:
+        rows = con.execute(stmt, args).fetchall()
+        con.commit()
+        return rows
+    finally:
+        con.close()
+
+
+def _backdate(db, days):
+    """Age every retention-bound row past any TTL, as if it arrived long ago."""
+    old = time.time() - days * 86400.0
+    for table, col in (("predictions", "created_at"), ("decisions", "created_at"),
+                       ("signals", "received_at")):
+        _sql(db, f"UPDATE {table} SET {col}=?", (old,))
+
+
+def _row_count(db, table, tenant):
+    return _sql(db, f"SELECT COUNT(*) FROM {table} WHERE tenant=?",
+                (tenant,))[0][0]
+
+
+def test_purge_dry_run_counts_but_deletes_nothing(tmp_path, monkeypatch, sim):
+    """Purge is irreversible and takes the audit trail with it; the dry run is
+    how an operator sees the blast radius before committing to it."""
+    client, db = _history_client(tmp_path, monkeypatch)
+    _seed_history(client, sim)
+    _backdate(db, days=10)
+
+    r = client.post("/v1/admin/purge", json={
+        "dry_run": True, "prediction_ttl_days": 5,
+        "decision_ttl_days": 5, "signal_ttl_days": 5}, headers=_hdr())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["dry_run"] is True
+    assert all(body["deleted"][t] > 0 for t in ("predictions", "decisions", "signals"))
+
+    for table in ("predictions", "decisions", "signals"):
+        assert _row_count(db, table, "tenantA") > 0, f"dry run deleted from {table}"
+
+
+def test_purge_deletes_only_what_is_past_its_own_ttl(tmp_path, monkeypatch, sim):
+    """Each table has its own TTL because each table is for something different:
+    cutting the signal TTL to match the others would destroy the propensity log
+    and with it the ability to re-evaluate off-policy."""
+    client, db = _history_client(tmp_path, monkeypatch)
+    _seed_history(client, sim)
+    _backdate(db, days=10)
+
+    r = client.post("/v1/admin/purge", json={
+        "prediction_ttl_days": 5, "decision_ttl_days": 5,
+        "signal_ttl_days": 400}, headers=_hdr())
+    assert r.status_code == 200, r.text
+    deleted = r.json()["deleted"]
+    assert deleted["predictions"] > 0 and deleted["decisions"] > 0
+    assert deleted["signals"] == 0
+
+    assert _row_count(db, "predictions", "tenantA") == 0
+    assert _row_count(db, "decisions", "tenantA") == 0
+    assert _row_count(db, "signals", "tenantA") > 0
+
+
+def test_purge_is_tenant_scoped(tmp_path, monkeypatch, sim):
+    """Deleting one tenant's history must not touch another's -- the same
+    isolation promise the read paths keep, on the path that destroys data."""
+    client, db = _history_client(tmp_path, monkeypatch)
+    _seed_history(client, sim, key=KEY_A)
+    _seed_history(client, sim, key=KEY_B)
+    _backdate(db, days=10)
+
+    r = client.post("/v1/admin/purge", json={
+        "prediction_ttl_days": 5, "decision_ttl_days": 5, "signal_ttl_days": 5},
+        headers=_hdr(KEY_A))
+    assert r.status_code == 200, r.text
+
+    for table in ("predictions", "decisions", "signals"):
+        assert _row_count(db, table, "tenantA") == 0
+        assert _row_count(db, table, "tenantB") > 0, f"purge leaked into {table}"
+
+
+def test_purge_requires_the_operator_token_when_one_is_configured(
+        tmp_path, monkeypatch, sim):
+    """The keys handed out for reading and reporting are the same keys, so a
+    tenant key alone must not be able to delete that tenant's whole audit trail
+    once an operator token exists."""
+    client, db = _history_client(tmp_path, monkeypatch, admin_token="op-token")
+    _seed_history(client, sim)
+
+    assert client.post("/v1/admin/purge", headers=_hdr()).status_code == 403
+    assert client.post("/v1/admin/purge", headers={
+        **_hdr(), "Authorization": "Bearer wrong"}).status_code == 403
+
+    r = client.post("/v1/admin/purge", headers={
+        **_hdr(), "Authorization": "Bearer op-token"})
+    assert r.status_code == 200, r.text
+    # and a refused call must not have deleted anything on its way out
+    assert _row_count(db, "signals", "tenantA") > 0

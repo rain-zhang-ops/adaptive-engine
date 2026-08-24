@@ -15,7 +15,9 @@ the product makes:
 
 from __future__ import annotations
 
+import json
 import math
+import sqlite3
 from collections import Counter
 
 import numpy as np
@@ -29,7 +31,7 @@ from engine.predicates import PredicateError, compile_predicate
 from engine.scorer import UtilityScorer
 from engine.service import EngineService
 from engine.simulator import SimConfig, Simulator
-from engine.store import SqliteStore, TenantItemStore
+from engine.store import MIGRATIONS, SqliteStore, TenantItemStore
 from engine.transition import TransitionError, get_transition
 
 
@@ -371,6 +373,55 @@ def test_tenants_cannot_see_each_other(tmp_path, sim):
     dec_b = svc.decide("B", "shared_user", count=5, now=50.0)
     assert dec_b.decision.fallback_reason == "empty_candidate_pool"
     assert svc.store.counts("B")["items"] == 0
+
+
+def _build_v1_database(path):
+    """A database as a v1 deployment left it: only the v1 tables, one item
+    carrying tags, version stamped 1. Rows that predate the backfills are the
+    whole point -- an upgrade tested on an empty database tests nothing."""
+    con = sqlite3.connect(path)
+    con.executescript(MIGRATIONS[0][1])
+    con.execute("CREATE TABLE schema_version ("
+                "version INTEGER PRIMARY KEY, applied_at REAL NOT NULL)")
+    con.execute("INSERT INTO schema_version(version, applied_at) VALUES (1, 0.0)")
+    con.execute("INSERT INTO items(tenant,item_id,tag_weights,difficulty_prior,attrs) "
+                "VALUES ('t','old-item',?,NULL,'{}')",
+                (json.dumps({"algebra": 1.0}),))
+    con.commit()
+    con.close()
+
+
+def test_store_upgrades_a_v1_database_and_backfills_it(tmp_path):
+    """The migrations docstring says the scripts exist 'so the upgrade path is
+    exercised rather than assumed' -- but no test ever opened an old database.
+    This one does: v1 in, current version out, with both backfills proven
+    against a row that predates them."""
+    db = tmp_path / "old.db"
+    _build_v1_database(db)
+
+    store = SqliteStore(db)
+    try:
+        assert store.schema_version == MIGRATIONS[-1][0]
+
+        # v2 backfill: the inverted index was built from pre-existing items,
+        # or recall would appear to work while returning nothing
+        recalled = store.recall_by_tags("t", ["algebra"], 10)
+        assert [i.id for i in recalled] == ["old-item"]
+
+        # v5 backfill: the permutation key must be filled in. Left at the
+        # default 0, every item shares one position and the coverage slice
+        # silently degrades to id order.
+        con = sqlite3.connect(db)
+        row = con.execute(
+            "SELECT shuffle_key FROM items WHERE item_id='old-item'").fetchone()
+        con.close()
+        assert row[0] != 0
+
+        # and the pre-existing row is still readable through the new schema
+        assert store.get_items("t", ["old-item"])[0].tag_weights == {"algebra": 1.0}
+        assert store.sample_items("t", 5)[0].id == "old-item"
+    finally:
+        store.close()
 
 
 def test_belief_survives_tag_space_growth(tmp_path, sim):

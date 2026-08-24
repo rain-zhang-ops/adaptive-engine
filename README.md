@@ -303,7 +303,7 @@ p~0.50  +0.0249        p~0.80  +0.0289
 
 ## 生产化：原先列出的缺口逐项处理结果
 
-`python -m pytest tests/ -q` → 77 passed（invariants 28 / HTTP 契约 37 / SDK 12）。
+`python -m pytest tests/ -q` → 90 passed（invariants 31 / HTTP 契约 47 / SDK 12）。
 
 ### 服务与状态
 
@@ -526,7 +526,7 @@ V(π_t) = E_l[ Σ_{a∈A_l} (π_t(a)/π_l(a)) · r_a ]
 - [x] 对外 / 对内契约，翻译表，两个领域的映射验证
 - [x] `Believe` 首个实现 MTOR + 合成模拟器 + 评估台
 - [x] `Score.value` / `Choose` / 翻译层 `policy.py`
-- [x] 区分度参数（按曝光量门控）
+- [x] 区分度参数（按曝光量门控；已实现但默认关闭 `learn_discrimination=False`，开启后的效果未在评估台上定价，故"AUC 差 0.064 来自缺失区分度"的判断仍然成立）
 - [x] 校准机制 + 对合成数据能否校准 `rho.target` 的判定（结论：不能）
 - [x] 转移模型插件（含每个假设的出处与状态标注）
 - [x] 状态持久化 + inflate 回路 + tag 空间增长
@@ -535,7 +535,7 @@ V(π_t) = E_l[ Σ_{a∈A_l} (π_t(a)/π_l(a)) · r_a ]
 - [x] HTTP 服务 + 鉴权 + 限流
 - [x] 可观测性（指标 / 结构化日志 / 在线校准）
 - [x] OPE 估计器 + 对真值的自校验
-- [x] 不变式 / 契约 / SDK 测试 77 项全通
+- [x] 不变式 / 契约 / SDK 测试 90 项全通（含 purge 三态、v1→当前版本迁移回填、shutdown 连接释放）
 - [x] 运维接口：readiness 探针 / schema 迁移 / 保留策略 / 用户导出删除 / API Key 轮换
 - [x] OpenMetrics 指标端点 + 每线程读连接
 - [x] 性能：Φ 向量化（360ms→78ms/decide）+ 消除 item 参数 N+1；实测容量（8-worker 33 QPS）

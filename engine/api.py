@@ -605,7 +605,13 @@ def create_app(
         if runtime.max_concurrency is not None:
             anyio.to_thread.current_default_thread_limiter().total_tokens = \
                 runtime.max_concurrency
-        yield
+        try:
+            yield
+        finally:
+            # Connections are per thread and tracked in the store precisely so
+            # they can be released here; without this, shutdown leaks every
+            # connection any worker thread ever opened.
+            store.close()
 
     app = FastAPI(title="Adaptive Decision API", version="1.0.0", lifespan=lifespan)
     app.state.service = svc

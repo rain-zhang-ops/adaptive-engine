@@ -1,0 +1,12 @@
+# Normalise line endings: LF in the repository, platform-native on checkout.
+# Without this, a CRLF working tree against an LF index makes every file
+# appear modified and hides the real diff.
+* text=auto
+
+# Shell scripts must keep LF even on Windows, or they break under bash/WSL.
+*.sh text eol=lf
+
+# Anything binary, declared so the filter never touches it.
+*.png binary
+*.jpg binary
+*.db binary

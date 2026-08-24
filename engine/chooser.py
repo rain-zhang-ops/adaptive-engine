@@ -9,6 +9,14 @@ while Phi stays submodular. That bound is part of the contract and is stated
 rather than hidden -- and it is why ``StructureSpec.weight`` must be
 non-negative: a sign flip destroys submodularity and the guarantee with it.
 
+The scope of that guarantee is stated just as plainly: of the shipped Phi
+kinds, only ``diversify`` (negative max-similarity) has a non-increasing
+marginal in general. ``concentrate`` (mean similarity) and ``balanced``
+(distance to a target entropy) do not -- their marginals can rise as the set
+grows -- so for those kinds greedy selection is a heuristic and no
+approximation bound is claimed. The submodularity invariant test therefore
+measures ``diversify`` only.
+
 Three things here are easy to get wrong and are handled explicitly:
 
 *Hard constraints are filters, not penalties.* Anything that must never be

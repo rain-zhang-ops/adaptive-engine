@@ -392,5 +392,10 @@ class Choose(Protocol):
         observability is intractable. The sanctioned approximation is
         one-step lookahead plus greedy selection, which carries a (1 - 1/e)
         guarantee while Phi stays submodular. That bound is part of the
-        contract and should be documented rather than hidden.
+        contract and should be documented rather than hidden -- including its
+        scope: of the shipped Phi kinds, only ``diversify`` (negative
+        max-similarity) is submodular in general. ``concentrate`` (mean
+        similarity) and ``balanced`` (distance to a target entropy) are not,
+        so for them greedy is a heuristic with no approximation bound; the
+        submodularity invariant test covers ``diversify`` only.
         """
