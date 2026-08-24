@@ -872,3 +872,64 @@ def test_purge_requires_the_operator_token_when_one_is_configured(
     assert r.status_code == 200, r.text
     # and a refused call must not have deleted anything on its way out
     assert _row_count(db, "signals", "tenantA") > 0
+
+
+# ---------------------------------------------------------------------------
+# DB-backed API keys: issue / revoke / expiry / cache semantics
+# ---------------------------------------------------------------------------
+
+
+def test_db_issued_key_works_and_revoke_takes_effect_immediately(client, sim):
+    """Rotation without a restart is the reason keys live in the database at
+    all. The chain being tested: issue -> resolves over HTTP to ITS tenant ->
+    revoke -> 401, all against a running app."""
+    _load(client, sim)
+    keys = client.app.state.keys
+
+    keys.issue("key-gamma", "tenantC", label="rotated in")
+    r = client.get("/v1/goals", headers=_hdr("key-gamma"))
+    assert r.status_code == 200, r.text
+
+    # the new key must resolve to its own tenant, not borrow another's catalogue
+    nxt = client.post("/v1/next", json={"user": "u1", "count": 3},
+                      headers=_hdr("key-gamma")).json()
+    assert nxt["fallback_reason"] == "empty_candidate_pool"
+
+    assert keys.revoke(key="key-gamma") is True
+    assert client.get("/v1/goals", headers=_hdr("key-gamma")).status_code == 401
+    # revoking twice is a no-op, not an error -- rotation scripts must be rerunnable
+    assert keys.revoke(key="key-gamma") is False
+
+    # an env-bootstrapped static key can be revoked through the same path
+    assert keys.revoke(key=KEY_A) is True
+    assert client.get("/v1/goals", headers=_hdr()).status_code == 401
+
+
+def test_expired_keys_are_rejected(tmp_path):
+    keys = ApiKeyRegistry(store=SqliteStore(tmp_path / "exp.db"))
+    app = create_app(store=keys.store, keys=keys,
+                     limiter=RateLimiter(rate_per_sec=1e6, burst=1e6))
+    c = TestClient(app)
+
+    keys.issue("key-past", "tenantA", expires_at=time.time() - 1)
+    assert c.get("/v1/goals", headers=_hdr("key-past")).status_code == 401
+
+    keys.issue("key-future", "tenantA", expires_at=time.time() + 3600)
+    assert c.get("/v1/goals", headers=_hdr("key-future")).status_code == 200
+
+
+def test_cross_process_revocation_lags_by_exactly_the_cache_ttl(tmp_path):
+    """The lookup cache makes every request not cost a query; the price is that
+    a revocation performed by ANOTHER process (straight to the store, bypassing
+    this registry's invalidation) is invisible until the entry's TTL expires.
+    That lag is the documented revocation window -- this pins it down."""
+    store = SqliteStore(tmp_path / "lag.db")
+    reg = ApiKeyRegistry(store=store, cache_ttl=5.0)
+    store.add_api_key(reg.digest("key-x"), "tenantA", now=100.0)
+
+    assert reg.resolve("key-x", now=1000.0) == "tenantA"      # warms the cache
+    store.revoke_api_key(reg.digest("key-x"), now=1000.5)     # another process
+
+    assert reg.resolve("key-x", now=1001.0) == "tenantA"      # inside the window
+    assert reg.resolve("key-x", now=1006.0) is None           # past it
+    store.close()

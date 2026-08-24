@@ -19,6 +19,7 @@ import json
 import math
 import sqlite3
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import pytest
@@ -357,6 +358,36 @@ def test_signals_are_idempotent(tmp_path, sim):
     second = svc.observe("t", rows, now=10.0)
     assert (first.accepted, first.duplicates) == (1, 0)
     assert (second.accepted, second.duplicates) == (0, 1)
+
+
+def test_concurrent_observers_lose_no_updates(tmp_path, sim):
+    """Two writers, same user, disjoint signals, interleaved small batches on a
+    FILE-backed store -- per-thread connections, so both writers really hold
+    their own connection. BEGIN IMMEDIATE must serialise the belief
+    read-modify-write: every signal lands exactly once, and no 'database is
+    locked' escapes to the caller. Raised inside a worker, the lock error
+    surfaces through ``f.result()`` and fails the test."""
+    svc = EngineService(SqliteStore(tmp_path / "cc.db"))
+    svc.register_items("t", sim.items[:40])
+
+    def worker(tag, offset):
+        accepted = 0
+        for j in range(10):
+            rows = [{"signal_id": f"{tag}-{j}-{k}", "user_id": "u1",
+                     "item_id": sim.items[offset + j * 2 + k].id,
+                     "outcome": 1.0, "ts": float(j)}
+                    for k in range(2)]
+            accepted += svc.observe("t", rows, now=10.0).accepted
+        return accepted
+
+    with ThreadPoolExecutor(2) as ex:
+        totals = [f.result() for f in (ex.submit(worker, "a", 0),
+                                       ex.submit(worker, "b", 20))]
+
+    assert sum(totals) == 40
+    assert svc.store.counts("t")["signals"] == 40
+    assert svc.profile("t", "u1", now=10.0)["known"] is True
+    svc.store.close()
 
 
 def test_tenants_cannot_see_each_other(tmp_path, sim):

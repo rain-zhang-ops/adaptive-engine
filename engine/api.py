@@ -130,9 +130,13 @@ class ApiKeyRegistry:
         if not d:
             return False
         ok = self.store.revoke_api_key(d)
-        self._static.pop(d, None)
+        # A static (env-bootstrapped) key has no database row, so the store
+        # reports nothing revoked -- but popping it here DID revoke it. Report
+        # either source, or a rotation script checking the return value would
+        # believe the key is still live while it is actually dead.
+        removed_static = self._static.pop(d, None) is not None
         self._invalidate(d)
-        return ok
+        return ok or removed_static
 
     def _invalidate(self, digest: str) -> None:
         with self._lock:

@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+# Three jobs, separately attributable: a red `test` means the contract broke,
+# a red `evals` means a measured property moved, a red `docker` means the
+# deployable artefact broke. One merged job would leave all three ambiguous.
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      # Import smoke first: a syntax error fails in seconds here rather than
+      # after the dependency install of the slowest test module.
+      - name: import smoke
+        run: python -c "import engine.api, engine.service, engine.store, engine.client"
+      - run: python -m pytest tests/ -q
+
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      # The harnesses are the source of every number in the README. They carry
+      # hard asserts (pool alignment, constraint satisfaction, OPE self-check),
+      # so a regression fails the step; the printed numbers are the audit trail.
+      - run: python -m engine.eval_mtor
+      - run: python -m engine.eval_choose
+      - run: python -m engine.ope
+      - run: python -m engine.calibrate
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t adaptive-engine .
+      - name: start
+        run: |
+          docker run -d --name engine -p 8080:8080 \
+            -e ADAPTIVE_API_KEYS="ci-key:tenantA" adaptive-engine
+      # Probe /readyz (really pings the database), not /healthz: the container
+      # is only done starting when its dependency answers.
+      - name: wait for readiness
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/readyz && exit 0
+            sleep 1
+          done
+          docker logs engine
+          exit 1
+      # The scrape must be authenticated: per-tenant counters are tenant
+      # information, and an unauthenticated 200 here is a finding, not a pass.
+      - name: scrape metrics with the API key
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/metrics)" = "401"
+          curl -sf -H "X-API-Key: ci-key" http://localhost:8080/metrics | head -5

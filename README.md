@@ -9,6 +9,32 @@
 
 ---
 
+## 这套代码给你的东西（功能价值）
+
+一句话：**把「给谁推什么」外包给内核，拿回一组带理由、可回放、可离线纠偏的候选。**
+
+接入方实际得到的是：
+
+- **零建模接入**。候选只要一个 id 就能开始；`tag`/`attrs` 可以后补，首次出现自动注册，没有"先建标签体系"这道门槛。
+- **说意图，不碰参数**。调用方给 `goal: "practice_weak"` 或拧形容词旋钮（`difficulty`/`focus`/`freshness`），永远接触不到 ρ/γ/Φ。
+- **结果自解释**。每个候选带给人看的 `why`（多语言，文案是数据不是代码）；降级时附 `hint` 告诉调用方下一步该怎么办。
+- **失败是软的**。冷启动、空目录、约束不可行一律 200 + `confidence: "low"` + `fallback_reason`，永不抛 5xx——SaaS 的 500 就是客户的线上故障。
+- **可回放、可纠偏**。每次决策有 `decision_id` 可完整重现；propensity 随决策落库，事后用 OPE 离线评估"换个策略会怎样"——不用拿真实流量试错。
+- **合规与运维现成**：多租户强隔离、用户数据导出/删除、审计保留策略、API Key 轮换吊销、OpenMetrics 指标——私有化部署和合规评审会问的这些都在。
+
+它**不**给你的（同样重要）：不接触 item 正文，没有内容理解和语义召回；`γ`/`Φ`/`rho.target` 目前全部标 `uncalibrated`——机制（`calibrate.py` + OPE）备好了，数值需要你的真实日志来定，在那之前不要把这些参数写进 SLA。
+
+## 场景说明：同一个内核在不同领域长什么样
+
+不同领域只差一份 adapter 映射和一个 goal，内核代码不变：
+
+- **K12 自适应练习**（`examples/jzjx.adapter.yaml`）：user=学生，item=题目，tag=知识点。`assess` 摸底测评（纯信息增益，数学上等价 CAT）；`practice_weak` 练薄弱；`review` 抢在遗忘前复习；`challenge` 拔高。
+- **电商 / 内容推荐**（`examples/commerce.adapter.yaml`）：user=买家，item=商品，tag=品类属性。`more_like_this` 偏好放大（带 `explore_floor`，防收敛成过滤气泡）；`explore` 带用户走出舒适区；`screen` 风险筛查，优先找出最可能出问题的部分。
+- **企业培训排程**：user=员工，item=课程模块，tag=技能项。`γ>0` 直接对应"这次练习预期改变多少状态"，`review` 按不确定性调度复习。
+- **任何"在约束下选一小组动作"的问题**：配额（`quota`）、硬排除（`predicate`）、单标签上限（`max_per_tag`）是一等公民——约束是过滤器，不是打分惩罚，分数再高的违禁项也漏不出来。
+
+---
+
 ## 跑起来
 
 ```bash
@@ -216,7 +242,7 @@ examples/
   jzjx.adapter.yaml       教育场景映射（K12 出题）
   commerce.adapter.yaml   电商场景映射（偏好放大）
 Dockerfile             单节点镜像：非 root、pin 依赖、HEALTHCHECK 探 /readyz
-../.github/workflows/ci.yml  CI（在仓库根）：test / evals / docker 三个可归因的 job
+.github/workflows/ci.yml  CI：test / evals / docker 三个可归因的 job
 ```
 
 两个 adapter 样例的作用是**验证抽象是否真的通用**：同一个内核、同一套契约，两个领域只差一份映射和一个 `goal`。接不住其中任何一个，说明抽象没做对。
@@ -303,7 +329,7 @@ p~0.50  +0.0249        p~0.80  +0.0289
 
 ## 生产化：原先列出的缺口逐项处理结果
 
-`python -m pytest tests/ -q` → 90 passed（invariants 31 / HTTP 契约 47 / SDK 12）。
+`python -m pytest tests/ -q` → 94 passed（invariants 32 / HTTP 契约 50 / SDK 12）。
 
 ### 服务与状态
 
@@ -535,7 +561,7 @@ V(π_t) = E_l[ Σ_{a∈A_l} (π_t(a)/π_l(a)) · r_a ]
 - [x] HTTP 服务 + 鉴权 + 限流
 - [x] 可观测性（指标 / 结构化日志 / 在线校准）
 - [x] OPE 估计器 + 对真值的自校验
-- [x] 不变式 / 契约 / SDK 测试 90 项全通（含 purge 三态、v1→当前版本迁移回填、shutdown 连接释放）
+- [x] 不变式 / 契约 / SDK 测试 94 项全通（含 purge 三态、v1→当前版本迁移回填、shutdown 连接释放、API Key 签发/吊销/过期/缓存窗口、并发 observe 不丢更新）
 - [x] 运维接口：readiness 探针 / schema 迁移 / 保留策略 / 用户导出删除 / API Key 轮换
 - [x] OpenMetrics 指标端点 + 每线程读连接
 - [x] 性能：Φ 向量化（360ms→78ms/decide）+ 消除 item 参数 N+1；实测容量（8-worker 33 QPS）
