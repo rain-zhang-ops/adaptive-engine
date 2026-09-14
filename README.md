@@ -329,7 +329,7 @@ p~0.50  +0.0249        p~0.80  +0.0289
 
 ## 生产化：原先列出的缺口逐项处理结果
 
-`python -m pytest tests/ -q` → 94 passed（invariants 32 / HTTP 契约 50 / SDK 12）。
+`python -m pytest tests/ -q` → 105 passed（invariants 34 / HTTP 契约 59 / SDK 12）。
 
 ### 服务与状态
 
@@ -561,7 +561,7 @@ V(π_t) = E_l[ Σ_{a∈A_l} (π_t(a)/π_l(a)) · r_a ]
 - [x] HTTP 服务 + 鉴权 + 限流
 - [x] 可观测性（指标 / 结构化日志 / 在线校准）
 - [x] OPE 估计器 + 对真值的自校验
-- [x] 不变式 / 契约 / SDK 测试 94 项全通（含 purge 三态、v1→当前版本迁移回填、shutdown 连接释放、API Key 签发/吊销/过期/缓存窗口、并发 observe 不丢更新）
+- [x] 不变式 / 契约 / SDK 测试 105 项全通（含 purge 三态、v1→当前版本迁移回填、shutdown 连接释放、API Key 签发/吊销/过期/缓存窗口、并发 observe 不丢更新）
 - [x] 运维接口：readiness 探针 / schema 迁移 / 保留策略 / 用户导出删除 / API Key 轮换
 - [x] OpenMetrics 指标端点 + 每线程读连接
 - [x] 性能：Φ 向量化（360ms→78ms/decide）+ 消除 item 参数 N+1；实测容量（8-worker 33 QPS）

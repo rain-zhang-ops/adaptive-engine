@@ -131,18 +131,70 @@ def _policy_hash(goal: str, tune: Mapping[str, Any] | None) -> str:
 
 def _merge_constraints(base: Mapping[str, Any] | None,
                        over: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    """Request constraints override policy constraints, key by key.
+    """Combine a policy's feasible set with a request's, request-only-tightening.
 
-    An L3 policy can ship a feasible set (embargo predicates, a kind quota), and
-    a single request can still tighten it further. Per-key override, not deep
-    merge, so a request that sets ``quotas`` replaces the policy's quotas wholesale
-    rather than silently concatenating two quota lists that may contradict.
+    A request may narrow what an L3 policy already restricted, never widen it. The
+    earlier ``{**base, **over}`` did the opposite: supplying any ``within.attrs``
+    replaced the policy's entire predicate list, so a request could silently drop
+    the policy's hard filters -- exactly the leak the constraint layer exists to
+    prevent. Sets that are *additional* constraints are therefore unioned
+    (predicates, excluded ids) or intersected (tag scopes, per-tag caps, quotas are
+    appended) rather than overwritten.
     """
     if not base:
         return dict(over) if over else None
     if not over:
         return dict(base)
-    return {**base, **over}
+    out: dict[str, Any] = {}
+
+    b_pred = list(base.get("predicates") or [])
+    o_pred = list(over.get("predicates") or [])
+    if b_pred or o_pred:
+        out["predicates"] = b_pred + o_pred
+
+    b_ex = set(base.get("exclude_item_ids") or ())
+    o_ex = set(over.get("exclude_item_ids") or ())
+    if b_ex or o_ex:
+        out["exclude_item_ids"] = sorted(b_ex | o_ex)
+
+    b_w = base.get("within_tags")
+    o_w = over.get("within_tags")
+    if b_w is not None and o_w is not None:
+        b_set = set(b_w)
+        merged = [t for t in o_w if t in b_set]
+        out["within_tags"] = merged
+        if not merged:
+            # Two disjoint scopes intersect to the empty set, which must mean
+            # "nothing is admissible". An empty ``within_tags`` is otherwise
+            # read as "no restriction at all" and would return the whole
+            # catalogue -- the opposite of what the caller asked for.
+            out["predicates"] = out.get("predicates", []) + ["id in []"]
+    elif b_w is not None:
+        out["within_tags"] = list(b_w)
+    elif o_w is not None:
+        out["within_tags"] = list(o_w)
+
+    b_m = base.get("max_per_tag")
+    o_m = over.get("max_per_tag")
+    if b_m is not None and o_m is not None:
+        out["max_per_tag"] = min(int(b_m), int(o_m))
+    elif b_m is not None:
+        out["max_per_tag"] = b_m
+    elif o_m is not None:
+        out["max_per_tag"] = o_m
+
+    b_q = list(base.get("quotas") or [])
+    o_q = list(over.get("quotas") or [])
+    if b_q or o_q:
+        out["quotas"] = b_q + o_q
+
+    # Any key this function does not know about is carried from the request, but
+    # a known tightening key is never taken verbatim from ``over``.
+    for k, v in over.items():
+        if k not in ("predicates", "exclude_item_ids", "within_tags",
+                     "max_per_tag", "quotas"):
+            out[k] = v
+    return out
 
 
 
@@ -404,12 +456,18 @@ class EngineService:
                        model_version=self.model_version, policy_id=policy_id)
 
         if dec.chosen:
-            self.store.log_predictions(
-                tenant, user_id, decision_id, self.model_version,
-                {c.item_id: c.p_hat for c in dec.chosen}, now)
-
-        self._log(tenant, decision_id, user_id, resolved.goal, policy_id, dec, now,
-                  recall_meta)
+            # Predictions and the audit row in one transaction: a crash between
+            # them would otherwise leave a calibration prediction with no decision
+            # to explain it (or vice versa).
+            with self.store.transaction() as con:
+                self.store.log_predictions(
+                    tenant, user_id, decision_id, self.model_version,
+                    {c.item_id: c.p_hat for c in dec.chosen}, now, con=con)
+                self._log(tenant, decision_id, user_id, resolved.goal, policy_id, dec,
+                          now, recall_meta, con=con)
+        else:
+            self._log(tenant, decision_id, user_id, resolved.goal, policy_id, dec,
+                      now, recall_meta)
         self.metrics.incr("decide", tenant=tenant, outcome=confidence)
         self.metrics.observe_latency("decide", timer.ms)
         return DecideResult(dec, decision_id, resolved.goal, resolved.applied,
@@ -460,6 +518,22 @@ class EngineService:
             # how an ingestion endpoint becomes the bottleneck.
             wanted = sorted({s["item_id"] for s in signals})
             catalogue = {it.id: it for it in self.store.get_items(tenant, wanted)}
+
+            # An item seen for the first time is registered here, which is what
+            # the contract promises: no up-front taxonomy or catalogue push is a
+            # precondition for reporting an outcome. The item lands untagged on
+            # the reserved latent dimension, and a later /v1/items push can attach
+            # real tags. Registering inside the same transaction keeps the signal
+            # and the item it references consistent.
+            missing = [iid for iid in wanted if iid not in catalogue]
+            if missing:
+                self.store.ensure_tags(tenant, (), con=con)
+                new_items = [Item(id=iid, tag_weights={}, difficulty_prior=None, attrs={})
+                             for iid in missing]
+                self.store.upsert_items(tenant, new_items, con=con)
+                catalogue.update({it.id: it for it in new_items})
+                unknown += len(missing)
+
             items.preload(list(catalogue))
 
             # Resolve propensities for referenced decisions in one batched read,
@@ -506,9 +580,11 @@ class EngineService:
                     # Online calibration: score the prediction we actually served
                     # against the outcome that came back. Consumed, so a re-served
                     # item cannot be counted twice.
-                    p_served = self.store.take_prediction(tenant, user_id, s["item_id"], con)
+                    p_served = self.store.take_prediction(
+                        tenant, user_id, s["item_id"], con,
+                        decision_id=s.get("decision_id"))
                     if p_served is not None:
-                        self.metrics.calibration.record(p_served, float(s["outcome"]))
+                        self.metrics.record_calibration(tenant, p_served, float(s["outcome"]))
 
                     sig = Signal(user_id=user_id, item_id=s["item_id"],
                                  outcome=float(s["outcome"]), ts=float(s["ts"]),
@@ -549,11 +625,16 @@ class EngineService:
         confirm what was registered, how its tags were parsed, or whether an id
         collided and overwrote something.
         """
-        page = self.store.list_items(tenant, after=after, limit=limit)
+        # Fetch one extra row to know whether a further page exists. Without the
+        # peek, a page that exactly filled the limit reported a cursor and forced
+        # the client into one final empty request.
+        page = self.store.list_items(tenant, after=after, limit=limit + 1)
+        has_more = len(page) > limit
+        page = page[:limit]
         items = [{"id": it.id, "tags": dict(it.tag_weights),
                   "difficulty_prior": it.difficulty_prior, "attrs": dict(it.attrs)}
                  for it in page]
-        next_after = page[-1].id if len(page) == limit else None
+        next_after = page[-1].id if has_more and page else None
         return {"items": items, "count": len(items), "next_after": next_after,
                 "total": self.store.item_count(tenant)}
 
@@ -625,7 +706,7 @@ class EngineService:
 
     def _log(self, tenant: str, decision_id: str, user_id: str, goal: str,
              policy_id: str, dec: Decision, now: float,
-             recall: Mapping[str, Any] | None = None) -> None:
+             recall: Mapping[str, Any] | None = None, con=None) -> None:
         payload = {
             "confidence": dec.confidence,
             "fallback_reason": dec.fallback_reason,
@@ -638,7 +719,8 @@ class EngineService:
         }
 
         self.store.log_decision(tenant, decision_id, user_id, goal, policy_id,
-                                self.model_version, dec.confidence, payload, now)
+                                self.model_version, dec.confidence, payload, now,
+                                con=con)
 
 
 def _fit(a: np.ndarray, n: int, fill: float) -> np.ndarray:

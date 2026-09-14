@@ -933,3 +933,131 @@ def test_cross_process_revocation_lags_by_exactly_the_cache_ttl(tmp_path):
     assert reg.resolve("key-x", now=1001.0) == "tenantA"      # inside the window
     assert reg.resolve("key-x", now=1006.0) is None           # past it
     store.close()
+
+
+# ---------------------------------------------------------------------------
+# regressions from the review pass
+# ---------------------------------------------------------------------------
+
+
+def test_scoped_item_ids_are_bounded(client, sim):
+    """The id-scoped recall path used to ignore the recall cap, so a huge caller
+    list forced every id to be loaded and scored."""
+    _load(client, sim)
+    r = client.post("/v1/next",
+                    json={"user": "u1", "count": 3,
+                          "within": {"item_ids": [f"i{n}" for n in range(501)]}},
+                    headers=_hdr())
+    assert r.status_code == 422
+
+
+def test_unknown_item_in_signal_is_registered_not_dropped(client, sim):
+    """The contract promises first appearance auto-registers; a caller that only
+    reports outcomes must not have every signal silently discarded."""
+    _load(client, sim)
+    r = client.post("/v1/signals", json={"signals": [
+        {"user": "u1", "item": "brand-new-item", "outcome": 1.0, "ts": 1.0,
+         "signal_id": "brand-new"}]}, headers=_hdr())
+    assert r.status_code == 200, r.text
+    assert r.json()["accepted"] == 1
+
+    got = client.get("/v1/items/brand-new-item", headers=_hdr())
+    assert got.status_code == 200 and got.json()["id"] == "brand-new-item"
+
+
+def test_metrics_calibration_is_tenant_scoped(client, sim):
+    """The process-wide calibration window aggregates every tenant's
+    predictions; a tenant-scoped scrape must not receive it."""
+    _load(client, sim)
+    served = client.post("/v1/next", json={"user": "u9", "count": 5},
+                         headers=_hdr()).json()
+    items = served["results"][0]["items"]
+    client.post("/v1/signals", json={"signals": [
+        {"user": "u9", "item": i["id"], "outcome": 1.0, "ts": 10.0 + n,
+         "signal_id": f"cal-{n}", "propensity": i["propensity"]}
+        for n, i in enumerate(items)]}, headers=_hdr())
+
+    mine = client.get("/metrics.json", headers=_hdr(KEY_A)).json()
+    assert mine["calibration"]["n"] == len(items)
+    theirs = client.get("/metrics.json", headers=_hdr(KEY_B)).json()
+    assert theirs["calibration"]["n"] == 0
+
+
+def test_empty_item_ids_scope_returns_nothing(client, sim):
+    """An explicitly empty scope means "no candidates", not "no scope at all"."""
+    _load(client, sim)
+    r = client.post("/v1/next",
+                    json={"user": "u1", "count": 3, "within": {"item_ids": []}},
+                    headers=_hdr())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["results"][0]["items"] == []
+    assert body["fallback_reason"] == "empty_candidate_pool"
+
+
+def test_attribute_value_with_a_quote_is_rejected(client, sim):
+    """The grammar cannot express a quote, and silently stripping it ran a filter
+    against the wrong value instead of reporting a fixable error."""
+    _load(client, sim)
+    r = client.post("/v1/next",
+                    json={"user": "u1", "count": 3,
+                          "within": {"attrs": {"title": "O'Brien"}}},
+                    headers=_hdr())
+    assert r.status_code == 400
+    assert "quote" in r.json()["detail"].lower()
+
+
+def test_freshness_must_be_below_one(client, sim):
+    """1.0 would spend every slot on exploration; the policy layer has always
+    rejected it, so the wire schema must too."""
+    _load(client, sim)
+    r = client.post("/v1/next", json={"user": "u1", "count": 3,
+                                      "tune": {"freshness": 1.0}}, headers=_hdr())
+    assert r.status_code == 422
+
+
+def test_request_constraints_cannot_loosen_a_policy_filter(client, sim):
+    """A request may only tighten an L3 policy's feasible set. Overriding the
+    predicate list (the old behaviour) would have dropped the policy's hard
+    filter entirely."""
+    _load(client, sim)
+    doc = {"id": "block-all", "extends": "practice_weak",
+           "constraints": {"predicates": ["attrs.kind == 'no_such_kind'"]}}
+    assert client.post("/v1/policies", json=doc, headers=_hdr()).status_code == 200
+
+    body = client.post("/v1/next",
+                       json={"user": "u1", "count": 5, "policy_ref": "block-all",
+                             "within": {"attrs": {"kind": "choice"}}},
+                       headers=_hdr()).json()
+    assert body["results"][0]["items"] == []
+    assert body["fallback_reason"] == "constraints_unsatisfiable"
+
+
+def test_item_listing_does_not_emit_a_trailing_empty_page(client, sim):
+    """A page that exactly fills the limit used to advertise a cursor and force
+    one final empty request."""
+    _load(client, sim, n=5)
+    page = client.get("/v1/items", params={"limit": 5}, headers=_hdr()).json()
+    assert page["count"] == 5
+    assert page["next_after"] is None
+
+
+def test_unhandled_error_returns_a_structured_500(tmp_path, monkeypatch):
+    """A bug the service did not convert into a soft degradation still has to use
+    the documented error envelope rather than Starlette's bare plain-text 500."""
+    from engine.service import EngineService
+
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(EngineService, "decide_many", boom)
+
+    keys = ApiKeyRegistry()
+    keys.add(KEY_A, "tenantA")
+    app = create_app(store=SqliteStore(tmp_path / "boom.db"), keys=keys,
+                     limiter=RateLimiter(rate_per_sec=1e6, burst=1e6))
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.post("/v1/next", json={"user": "u1", "count": 3}, headers=_hdr())
+    assert r.status_code == 500
+    assert r.json() == {"error": "internal_error",
+                        "detail": "internal server error"}

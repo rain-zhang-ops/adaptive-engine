@@ -528,14 +528,17 @@ paths:
           schema: { type: string }
       responses:
         "200":
-          description: 该 user 名下的 signals 与 decisions
+          description: 该 user 名下的 belief、signals、decisions 与 predictions
           content:
             application/json:
               schema:
                 type: object
                 properties:
+                  user_id: { type: string }
+                  belief: { type: object, nullable: true, additionalProperties: true }
                   signals: { type: array, items: { type: object, additionalProperties: true } }
                   decisions: { type: array, items: { type: object, additionalProperties: true } }
+                  predictions: { type: array, items: { type: object, additionalProperties: true } }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/RateLimited" }
 
@@ -784,8 +787,9 @@ components:
         freshness:
           type: number
           minimum: 0
+          exclusiveMaximum: true
           maximum: 1
-          description: 结果中「没见过 / 不确定」的比例。过低会让推荐越来越窄。
+          description: 结果中「没见过 / 不确定」的比例。取 [0, 1)。过低会让推荐越来越窄，取 1 会把全部槽位用于探索，禁止。
         stakes:
           type: string
           description: 容错带宽（如 low / normal / high）。
@@ -1052,7 +1056,7 @@ components:
       properties:
         accepted: { type: integer }
         duplicates: { type: integer, description: 因 signal_id 命中而被忽略的重投 }
-        unknown_items: { type: integer, description: 引用了不存在 item 的信号数 }
+        unknown_items: { type: integer, description: 引用尚未注册 item 的信号数；这些 item 在本次请求中已自动注册（无标签，落到 latent 维度） }
         backfilled_propensity:
           type: integer
           description: 无 propensity 但凭 decision_id 查到并补上的信号数。

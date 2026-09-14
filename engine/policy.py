@@ -626,9 +626,18 @@ def constraints_from(spec: Mapping[str, Any] | None, k: int) -> Constraints:
         Quota(group_by=q["group_by"], counts={str(a): int(b) for a, b in q["counts"].items()})
         for q in spec.get("quotas") or []
     )
-    total = sum(sum(q.counts.values()) for q in quotas)
-    if total > k:
-        raise PolicyError(f"quotas require {total} slots but k={k}")
+    for q in quotas:
+        if not is_valid_path(q.group_by):
+            # An unaddressable path silently reads as the string "None" and the
+            # quota groups nothing, so the requirement can never be met -- a
+            # silent unsatisfiable constraint instead of a caller error.
+            raise PolicyError(
+                f"quota.group_by {q.group_by!r} is not an addressable path "
+                f"({PATH_SYNTAX})")
+    # A quota set that asks for more slots than ``k`` is deliberately NOT rejected
+    # here: infeasibility is a property of the request, and the chooser reports it
+    # as a soft ``constraints_unsatisfiable`` rather than a 400. Policy registration
+    # already validated the operator-supplied expressions.
     max_per_tag = spec.get("max_per_tag")
     if max_per_tag is not None:
         max_per_tag = int(max_per_tag)

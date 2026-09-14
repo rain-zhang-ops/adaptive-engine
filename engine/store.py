@@ -226,6 +226,41 @@ MIGRATIONS: list[tuple[int, str]] = [
         version INTEGER NOT NULL
     );
     """),
+
+    # Key a prediction by the decision that served it, not just (user, item).
+    #
+    # Under the old primary key, serving the same item to a user in a second
+    # decision before the first outcome arrived *overwrote* the first p_hat, so
+    # the eventual outcome was scored against the wrong estimate and the original
+    # impression was never calibrated at all. Including decision_id makes every
+    # served estimate independently scoreable, and lets a signal that carries a
+    # decision_id consume exactly the prediction it answers.
+    #
+    # SQLite cannot alter a primary key, so the table is rebuilt. Autocommit is
+    # disabled around the rebuild so a crash cannot leave a half-renamed table;
+    # the trailing COMMIT restores the default before _migrate runs its own
+    # bookkeeping.
+    (7, """
+    BEGIN;
+    CREATE TABLE predictions_v7 (
+        tenant      TEXT NOT NULL,
+        user_id     TEXT NOT NULL,
+        item_id     TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        p_hat       REAL NOT NULL,
+        model_ver   TEXT NOT NULL,
+        created_at  REAL NOT NULL,
+        PRIMARY KEY (tenant, user_id, item_id, decision_id)
+    );
+    INSERT OR IGNORE INTO predictions_v7
+        (tenant, user_id, item_id, decision_id, p_hat, model_ver, created_at)
+        SELECT tenant, user_id, item_id, decision_id, p_hat, model_ver, created_at
+        FROM predictions;
+    DROP TABLE predictions;
+    ALTER TABLE predictions_v7 RENAME TO predictions;
+    CREATE INDEX IF NOT EXISTS predictions_created ON predictions(tenant, created_at);
+    COMMIT;
+    """),
 ]
 
 
@@ -424,8 +459,16 @@ class SqliteStore:
         if version == 5:
             cols = {r["name"] for r in con.execute("PRAGMA table_info(items)").fetchall()}
             if "shuffle_key" not in cols:
-                con.execute("ALTER TABLE items ADD COLUMN shuffle_key "
-                            "INTEGER NOT NULL DEFAULT 0")
+                try:
+                    con.execute("ALTER TABLE items ADD COLUMN shuffle_key "
+                                "INTEGER NOT NULL DEFAULT 0")
+                except sqlite3.OperationalError as exc:
+                    # In-process runs are serialised by ``_migrate``'s lock, but a
+                    # second *process* can pass the same check and race the ALTER.
+                    # Losing that race is not an error -- the column exists, which
+                    # is all this migration wanted.
+                    if "duplicate column" not in str(exc).lower():
+                        raise
             con.execute("CREATE INDEX IF NOT EXISTS items_shuffle "
                         "ON items(tenant, shuffle_key, item_id)")
             rows = con.execute("SELECT tenant, item_id FROM items").fetchall()
@@ -447,7 +490,8 @@ class SqliteStore:
         return TagSpace(index_of={r["tag"]: r["idx"] for r in rows},
                         tag_of=[r["tag"] for r in rows])
 
-    def ensure_tags(self, tenant: str, tags: Iterable[str]) -> TagSpace:
+    def ensure_tags(self, tenant: str, tags: Iterable[str],
+                    con: sqlite3.Connection | None = None) -> TagSpace:
         """Register unseen tags and return the resulting space.
 
         The reserved latent dimension is created first for every tenant, so an
@@ -455,18 +499,28 @@ class SqliteStore:
         taxonomy up front would be an adoption blocker, so the space grows on
         first sight instead.
         """
-        wanted = [TagSpace.LATENT] + [t for t in dict.fromkeys(tags) if t != TagSpace.LATENT]
-        with self.transaction() as con:
-            rows = con.execute("SELECT tag, idx FROM tags WHERE tenant = ?", (tenant,)).fetchall()
-            index = {r["tag"]: r["idx"] for r in rows}
-            nxt = max(index.values()) + 1 if index else 0
-            for t in wanted:
-                if t in index:
-                    continue
-                con.execute("INSERT INTO tags(tenant, tag, idx) VALUES (?,?,?)", (tenant, t, nxt))
-                index[t] = nxt
-                nxt += 1
+        if con is not None:
+            # Already inside a caller's transaction; joining it keeps tag
+            # registration atomic with the item write that needed it.
+            self._ensure_tags_con(con, tenant, tags)
+            return self.tag_space(tenant)
+        with self.transaction() as c:
+            self._ensure_tags_con(c, tenant, tags)
         return self.tag_space(tenant)
+
+    @staticmethod
+    def _ensure_tags_con(con: sqlite3.Connection, tenant: str,
+                         tags: Iterable[str]) -> None:
+        wanted = [TagSpace.LATENT] + [t for t in dict.fromkeys(tags) if t != TagSpace.LATENT]
+        rows = con.execute("SELECT tag, idx FROM tags WHERE tenant = ?", (tenant,)).fetchall()
+        index = {r["tag"]: r["idx"] for r in rows}
+        nxt = max(index.values()) + 1 if index else 0
+        for t in wanted:
+            if t in index:
+                continue
+            con.execute("INSERT INTO tags(tenant, tag, idx) VALUES (?,?,?)", (tenant, t, nxt))
+            index[t] = nxt
+            nxt += 1
 
     # -- beliefs -----------------------------------------------------------
 
@@ -499,47 +553,54 @@ class SqliteStore:
 
     # -- items -------------------------------------------------------------
 
-    def upsert_items(self, tenant: str, items: Sequence[Item]) -> dict[str, int]:
+    def upsert_items(self, tenant: str, items: Sequence[Item],
+                     con: sqlite3.Connection | None = None) -> dict[str, int]:
         """Register or update items; returns created/updated counts.
 
         The split is reported because "did my 5000-item push create rows or
         overwrite them?" is otherwise unanswerable from the outside, and silence
         there is how a caller discovers an id collision months later.
         """
+        if con is not None:
+            return self._upsert_items_con(con, tenant, items)
+        with self.transaction() as c:
+            return self._upsert_items_con(c, tenant, items)
+
+    def _upsert_items_con(self, con: sqlite3.Connection, tenant: str,
+                          items: Sequence[Item]) -> dict[str, int]:
         ids = [it.id for it in items]
-        with self.transaction() as con:
-            existing: set[str] = set()
-            for i in range(0, len(ids), 500):
-                chunk = ids[i:i + 500]
-                marks = ",".join("?" * len(chunk))
-                existing.update(r["item_id"] for r in con.execute(
-                    f"SELECT item_id FROM items WHERE tenant = ? AND item_id IN ({marks})",
-                    (tenant, *chunk)).fetchall())
-            for it in items:
-                con.execute(
-                    "INSERT INTO items(tenant,item_id,tag_weights,difficulty_prior,attrs,"
-                    "shuffle_key) VALUES (?,?,?,?,?,?) "
-                    "ON CONFLICT(tenant,item_id) DO UPDATE SET "
-                    "tag_weights=excluded.tag_weights, "
-                    "difficulty_prior=excluded.difficulty_prior, attrs=excluded.attrs",
-                    (tenant, it.id, json.dumps(dict(it.tag_weights)),
-                     it.difficulty_prior, json.dumps(dict(it.attrs)),
-                     shuffle_key(it.id)),
-                )
-                # Re-tagging must remove stale edges, or an item keeps being
-                # recalled under a tag it no longer carries.
-                con.execute("DELETE FROM item_tags WHERE tenant = ? AND item_id = ?",
-                            (tenant, it.id))
-                if it.tag_weights:
-                    con.executemany(
-                        "INSERT INTO item_tags(tenant,tag,item_id,weight) VALUES (?,?,?,?)",
-                        [(tenant, t, it.id, float(w)) for t, w in it.tag_weights.items()])
-            # Inside the same transaction as the writes: a reader that sees the
-            # new rows must also see the new generation, or it would cache the
-            # fresh row under the old generation and then never re-read it.
-            con.execute("INSERT INTO catalogue_version(tenant, version) VALUES (?, 1) "
-                        "ON CONFLICT(tenant) DO UPDATE SET version = version + 1",
-                        (tenant,))
+        existing: set[str] = set()
+        for i in range(0, len(ids), 500):
+            chunk = ids[i:i + 500]
+            marks = ",".join("?" * len(chunk))
+            existing.update(r["item_id"] for r in con.execute(
+                f"SELECT item_id FROM items WHERE tenant = ? AND item_id IN ({marks})",
+                (tenant, *chunk)).fetchall())
+        for it in items:
+            con.execute(
+                "INSERT INTO items(tenant,item_id,tag_weights,difficulty_prior,attrs,"
+                "shuffle_key) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(tenant,item_id) DO UPDATE SET "
+                "tag_weights=excluded.tag_weights, "
+                "difficulty_prior=excluded.difficulty_prior, attrs=excluded.attrs",
+                (tenant, it.id, json.dumps(dict(it.tag_weights)),
+                 it.difficulty_prior, json.dumps(dict(it.attrs)),
+                 shuffle_key(it.id)),
+            )
+            # Re-tagging must remove stale edges, or an item keeps being
+            # recalled under a tag it no longer carries.
+            con.execute("DELETE FROM item_tags WHERE tenant = ? AND item_id = ?",
+                        (tenant, it.id))
+            if it.tag_weights:
+                con.executemany(
+                    "INSERT INTO item_tags(tenant,tag,item_id,weight) VALUES (?,?,?,?)",
+                    [(tenant, t, it.id, float(w)) for t, w in it.tag_weights.items()])
+        # Inside the same transaction as the writes: a reader that sees the
+        # new rows must also see the new generation, or it would cache the
+        # fresh row under the old generation and then never re-read it.
+        con.execute("INSERT INTO catalogue_version(tenant, version) VALUES (?, 1) "
+                    "ON CONFLICT(tenant) DO UPDATE SET version = version + 1",
+                    (tenant,))
         updated = len(set(ids) & existing)
         return {"total": len(items), "created": len(set(ids)) - updated, "updated": updated}
 
@@ -579,7 +640,11 @@ class SqliteStore:
         if item_ids is not None:
             with self._guard():
                 gen = self._catalogue_gen(tenant)
-            return self._items_by_ids(tenant, list(item_ids), gen)
+            # The id branch used to ignore ``limit`` entirely, so a caller could
+            # pass an arbitrarily long list and force every id to be loaded and
+            # scored -- the recall cap bypassed by choosing the other entry point.
+            ids = list(item_ids)[:max(0, limit)]
+            return self._items_by_ids(tenant, ids, gen)
         with self._guard():
             gen = self._catalogue_gen(tenant)
             rows = self._con.execute(
@@ -610,23 +675,31 @@ class SqliteStore:
             "SELECT version FROM catalogue_version WHERE tenant = ?", (tenant,)).fetchone()
         return int(row["version"]) if row else 0
 
-    def _items_from(self, tenant: str, rows: Sequence[sqlite3.Row], gen: int) -> list[Item]:
-        """Decode rows into Items, reusing anything already decoded.
+    def _align_generation(self, tenant: str, gen: int) -> None:
+        """Advance the tenant's decoded-item cache to ``gen`` when it is newer.
 
-        The generation check is what makes this safe across processes: a sibling
-        worker's upsert bumps ``catalogue_version``, and this drops the tenant's
-        entries rather than serving what it parsed before the change.
-
-        Endpoints are sync ``def``, so Starlette runs them on a threadpool and
-        several threads share this cache. The purge therefore has to be atomic
-        with respect to the flag that says it happened: publishing the new
-        generation *before* finishing the purge would let a second thread skip
-        invalidation and then read an entry the first thread had not yet removed.
-        Hence double-checked locking, with the flag set last.
+        Only ever moves forward. A thread holding rows selected under an older
+        generation must not roll the cache back after another thread has already
+        published a newer one: doing that would leave stale entries labelled
+        fresh, which is exactly the race the generation counter exists to stop.
         """
-        if not rows:
-            return []
-        self._expire(tenant, gen)
+        with self._cache_lock:
+            cur = self._cache_gen.get(tenant)
+            if cur is None or gen > cur:
+                for key in [k for k in self._item_cache if k[0] == tenant]:
+                    self._item_cache.pop(key, None)
+                # Derived from the metadata just dropped, so it expires with it.
+                self._pairs_cache.pop(tenant, None)
+                if len(self._item_cache) > self.ITEM_CACHE_MAX:
+                    self._item_cache.clear()
+                    self._pairs_cache.clear()
+                    self._cache_gen.clear()
+                self._cache_gen[tenant] = gen
+
+    def _populate_locked(self, tenant: str,
+                         rows: Sequence[sqlite3.Row]) -> list[Item]:
+        """Decode rows into Items, reusing anything already decoded. Caller holds
+        ``_cache_lock`` and has confirmed the generation matches."""
         cache = self._item_cache
         out: list[Item] = []
         for r in rows:
@@ -638,22 +711,45 @@ class SqliteStore:
             out.append(item)
         return out
 
-    def _expire(self, tenant: str, gen: int) -> None:
-        """Drop the tenant's cached metadata if its catalogue has moved on."""
-        if self._cache_gen.get(tenant) == gen:
-            return
+    def _items_from(self, tenant: str, rows: Sequence[sqlite3.Row], gen: int) -> list[Item]:
+        """Decode rows into Items, reusing anything already decoded.
+
+        The generation check is what makes this safe across processes: a sibling
+        worker's upsert bumps ``catalogue_version``, and this drops the tenant's
+        entries rather than serving what it parsed before the change.
+
+        Endpoints are sync ``def``, so Starlette runs them on a threadpool and
+        several threads share this cache. The whole check-and-populate therefore
+        runs under ``_cache_lock``; the earlier version read the generation and
+        wrote entries in two separate steps, so a thread could interleave a
+        generation bump between them and install pre-bump rows under the new
+        label, where nothing would ever evict them.
+        """
+        if not rows:
+            return []
+        self._align_generation(tenant, gen)
         with self._cache_lock:
             if self._cache_gen.get(tenant) == gen:
-                return
-            for key in [k for k in self._item_cache if k[0] == tenant]:
-                self._item_cache.pop(key, None)
-            # Derived from the metadata just dropped, so it expires with it.
-            self._pairs_cache.pop(tenant, None)
-            if len(self._item_cache) > self.ITEM_CACHE_MAX:
-                self._item_cache.clear()
-                self._pairs_cache.clear()
-                self._cache_gen.clear()
-            self._cache_gen[tenant] = gen
+                return self._populate_locked(tenant, rows)
+        # The catalogue moved on while these rows were in flight. Decode them but
+        # do not install them; the next read under the current generation fetches
+        # what it needs.
+        return [self._row_to_item(r) for r in rows]
+
+    def _fetch_items(self, tenant: str, ids: Sequence[str]) -> dict[str, Item]:
+        out: dict[str, Item] = {}
+        if not ids:
+            return out
+        with self._guard():
+            for i in range(0, len(ids), 500):    # SQLite parameter cap
+                chunk = ids[i:i + 500]
+                marks = ",".join("?" * len(chunk))
+                for r in self._con.execute(
+                        f"SELECT item_id, tag_weights, difficulty_prior, attrs "
+                        f"FROM items WHERE tenant = ? AND item_id IN ({marks})",
+                        (tenant, *chunk)).fetchall():
+                    out[r["item_id"]] = self._row_to_item(r)
+        return out
 
     def _items_by_ids(self, tenant: str, ids: Sequence[str], gen: int) -> list[Item]:
         """Resolve ids in order, reading metadata only for what is not cached.
@@ -669,25 +765,28 @@ class SqliteStore:
         """
         if not ids:
             return []
-        self._expire(tenant, gen)
-        cache = self._item_cache
-        missing = [i for i in ids if (tenant, i) not in cache]
+        self._align_generation(tenant, gen)
+        with self._cache_lock:
+            valid = self._cache_gen.get(tenant) == gen
+            if valid:
+                hits = {i: self._item_cache[(tenant, i)] for i in ids
+                        if (tenant, i) in self._item_cache}
+                missing = [i for i in ids if (tenant, i) not in self._item_cache]
+            else:
+                hits = {}
+                missing = list(ids)
         if missing:
-            with self._guard():
-                for i in range(0, len(missing), 500):    # SQLite parameter cap
-                    chunk = missing[i:i + 500]
-                    marks = ",".join("?" * len(chunk))
-                    for r in self._con.execute(
-                            f"SELECT item_id, tag_weights, difficulty_prior, attrs "
-                            f"FROM items WHERE tenant = ? AND item_id IN ({marks})",
-                            (tenant, *chunk)).fetchall():
-                        cache[(tenant, r["item_id"])] = self._row_to_item(r)
-        out = []
-        for i in ids:
-            item = cache.get((tenant, i))
-            if item is not None:
-                out.append(item)
-        return out
+            fetched = self._fetch_items(tenant, missing)
+            if valid:
+                # Re-check under the lock: an upsert may have committed while the
+                # fetch was in flight, in which case these rows are stale and must
+                # not be installed.
+                with self._cache_lock:
+                    if self._cache_gen.get(tenant) == gen:
+                        for i, it in fetched.items():
+                            self._item_cache[(tenant, i)] = it
+            hits.update(fetched)
+        return [hits[i] for i in ids if i in hits]
 
 
     def tag_pairs_cache(self, tenant: str) -> dict:
@@ -858,9 +957,9 @@ class SqliteStore:
     def signals_for_ope(self, tenant: str, limit: int = 100000) -> list[dict]:
         with self._guard():
             rows = self._con.execute(
-                "SELECT user_id,item_id,outcome,ts,propensity,policy_id FROM signals "
-                "WHERE tenant = ? AND propensity IS NOT NULL ORDER BY ts LIMIT ?",
-                (tenant, limit)).fetchall()
+                "SELECT decision_id,user_id,item_id,outcome,ts,propensity,policy_id "
+                "FROM signals WHERE tenant = ? AND propensity IS NOT NULL "
+                "ORDER BY ts LIMIT ?", (tenant, limit)).fetchall()
         return [dict(r) for r in rows]
 
     # -- decisions (audit) -------------------------------------------------
@@ -970,9 +1069,9 @@ class SqliteStore:
                         con=None) -> None:
         sql = ("INSERT INTO predictions(tenant,user_id,item_id,p_hat,decision_id,"
                "model_ver,created_at) VALUES (?,?,?,?,?,?,?) "
-               "ON CONFLICT(tenant,user_id,item_id) DO UPDATE SET "
-               "p_hat=excluded.p_hat, decision_id=excluded.decision_id, "
-               "model_ver=excluded.model_ver, created_at=excluded.created_at")
+               "ON CONFLICT(tenant,user_id,item_id,decision_id) DO UPDATE SET "
+               "p_hat=excluded.p_hat, model_ver=excluded.model_ver, "
+               "created_at=excluded.created_at")
         rows = [(tenant, user_id, iid, float(p), decision_id, model_ver, now)
                 for iid, p in preds.items()]
         if not rows:
@@ -983,17 +1082,39 @@ class SqliteStore:
         with self.transaction() as c:
             c.executemany(sql, rows)
 
-    def take_prediction(self, tenant: str, user_id: str, item_id: str, con) -> float | None:
+    def take_prediction(self, tenant: str, user_id: str, item_id: str, con,
+                        decision_id: str | None = None) -> float | None:
         """Read and consume the stored prediction for a served item, inside the
         observe transaction. Consuming it means each served prediction scores at
-        most one outcome -- no double counting when an item is re-served."""
+        most one outcome -- no double counting when an item is re-served.
+
+        With a ``decision_id`` the exact impression is consumed, so an outcome
+        answering an older decision is not scored against a newer estimate for
+        the same (user, item). Without one, the most recent unconsumed prediction
+        is used as a best effort.
+        """
+        if decision_id is not None:
+            row = con.execute(
+                "SELECT p_hat FROM predictions WHERE tenant=? AND user_id=? "
+                "AND item_id=? AND decision_id=?",
+                (tenant, user_id, item_id, decision_id)).fetchone()
+            if row is None:
+                return None
+            con.execute(
+                "DELETE FROM predictions WHERE tenant=? AND user_id=? AND item_id=? "
+                "AND decision_id=?",
+                (tenant, user_id, item_id, decision_id))
+            return float(row["p_hat"])
         row = con.execute(
-            "SELECT p_hat FROM predictions WHERE tenant=? AND user_id=? AND item_id=?",
+            "SELECT decision_id, p_hat FROM predictions WHERE tenant=? AND user_id=? "
+            "AND item_id=? ORDER BY created_at DESC LIMIT 1",
             (tenant, user_id, item_id)).fetchone()
         if row is None:
             return None
-        con.execute("DELETE FROM predictions WHERE tenant=? AND user_id=? AND item_id=?",
-                    (tenant, user_id, item_id))
+        con.execute(
+            "DELETE FROM predictions WHERE tenant=? AND user_id=? AND item_id=? "
+            "AND decision_id=?",
+            (tenant, user_id, item_id, row["decision_id"]))
         return float(row["p_hat"])
 
     # -- retention ---------------------------------------------------------
@@ -1060,11 +1181,19 @@ class SqliteStore:
                 "SELECT decision_id,goal,policy_id,model_ver,confidence,payload,created_at "
                 "FROM decisions WHERE tenant=? AND user_id=? ORDER BY created_at",
                 (tenant, user_id)).fetchall()
+            preds = con.execute(
+                "SELECT item_id,decision_id,p_hat,model_ver,created_at "
+                "FROM predictions WHERE tenant=? AND user_id=? ORDER BY created_at",
+                (tenant, user_id)).fetchall()
         return {
             "user_id": user_id,
             "belief": dict(belief) if belief else None,
             "signals": [dict(r) for r in sigs],
             "decisions": [dict(r) for r in decs],
+            # Included because delete_user erases them too: an export that omits a
+            # table the erasure touches is not the complete record a data-access
+            # request is asking for.
+            "predictions": [dict(r) for r in preds],
         }
 
     def delete_user(self, tenant: str, user_id: str) -> dict[str, int]:

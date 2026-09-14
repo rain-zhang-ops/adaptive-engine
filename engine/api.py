@@ -276,7 +276,7 @@ class TuneIn(BaseModel):
 
     difficulty: str | None = None
     focus: str | None = None
-    freshness: float | None = Field(default=None, ge=0.0, le=1.0)
+    freshness: float | None = Field(default=None, ge=0.0, lt=1.0)
     stakes: str | None = None
 
     def as_tune(self) -> dict[str, Any]:
@@ -292,13 +292,13 @@ class WithinIn(BaseModel):
 
     tags: list[str] | None = None
     attrs: dict[str, Any] | None = None
-    item_ids: list[str] | None = None
+    item_ids: list[str] | None = Field(default=None, max_length=500)
 
 
 class ExcludeIn(BaseModel):
     model_config = {"extra": "forbid"}
 
-    item_ids: list[str] | None = None
+    item_ids: list[str] | None = Field(default=None, max_length=500)
     attrs: dict[str, Any] | None = None
     max_per_tag: int | None = Field(default=None, ge=1)
 
@@ -429,12 +429,17 @@ class PurgeRequest(BaseModel):
 # the app's own Renderer so a tenant can supply its own why.yaml.
 
 _DEFAULT_RENDERER: Renderer | None = None
+_DEFAULT_RENDERER_LOCK = threading.Lock()
 
 
 def _default_renderer() -> Renderer:
     global _DEFAULT_RENDERER
     if _DEFAULT_RENDERER is None:
-        _DEFAULT_RENDERER = load_renderer()
+        # Two first-callers could otherwise each build the renderer; harmless but
+        # wasteful, and the lock makes the initialisation clearly once-only.
+        with _DEFAULT_RENDERER_LOCK:
+            if _DEFAULT_RENDERER is None:
+                _DEFAULT_RENDERER = load_renderer()
     return _DEFAULT_RENDERER
 
 
@@ -492,13 +497,18 @@ def _check_attr_key(key: str, where: str) -> None:
             f"({PATH_SYNTAX})")
 
 
-def _lit(v: Any) -> str:
+def _lit(v: Any, depth: int = 0) -> str:
     """Render a JSON value as a predicate literal.
 
     ``None`` and lists get their own forms rather than being stringified: an
     ``attrs.k == 'None'`` or ``attrs.k == '[a, b]'` compiles fine and then never
     matches anything, which is a filter that fails without saying so.
     """
+    if depth > 4:
+        # The predicate grammar caps literal nesting too; without a guard here a
+        # deeply nested list in an attribute filter would blow the Python stack
+        # before it ever reached that check.
+        raise PolicyError("attribute filter value is nested too deeply")
     if v is None:
         return "null"
     if isinstance(v, bool):
@@ -509,10 +519,19 @@ def _lit(v: Any) -> str:
                 f"non-finite number {v!r} cannot be used as an attribute filter")
         return str(v)
     if isinstance(v, (list, tuple)):
-        return "[" + ", ".join(_lit(x) for x in v) + "]"
+        return "[" + ", ".join(_lit(x, depth + 1) for x in v) + "]"
     if isinstance(v, Mapping):
         raise PolicyError("attribute filters compare scalars or lists, not objects")
-    return "'" + str(v).replace("'", "") + "'"
+    s = str(v)
+    if "'" in s or "\\" in s:
+        # The grammar has quoted strings but no escape sequences, so a value
+        # carrying a quote cannot be expressed. Stripping the quote (the old
+        # behaviour) turned ``O'Brien`` into ``OBrien`` and ran a filter that
+        # silently matched the wrong rows; refusing is a 400 the caller can fix.
+        raise PolicyError(
+            f"attribute value {v!r} contains a quote or backslash, which the "
+            f"constraint grammar cannot express")
+    return "'" + s + "'"
 
 
 _STATUS_NAMES = {400: "bad_request", 401: "unauthorized", 403: "forbidden",
@@ -531,6 +550,25 @@ def _error(status: int, code: str, detail: str) -> HTTPException:
 
 
 def _origin_of(request: Request) -> str:
+    """Best-effort client identity for throttling failed authentications.
+
+    Behind a proxy or NAT every legitimate caller shares ``request.client.host``,
+    so keying the failure bucket on it lets one attacker lock out everyone. Set
+    ``ADAPTIVE_TRUST_PROXY=1`` when the app sits behind a proxy that overwrites
+    ``X-Forwarded-For``/``X-Real-IP``; the headers are ignored otherwise, because
+    a direct client can forge them and evade throttling entirely.
+    """
+    trust_proxy = os.environ.get("ADAPTIVE_TRUST_PROXY", "").strip().lower() in (
+        "1", "true", "yes", "on")
+    if trust_proxy:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            first = fwd.split(",")[0].strip()
+            if first:
+                return first
+        real = request.headers.get("x-real-ip")
+        if real and real.strip():
+            return real.strip()
     client = request.client
     return client.host if client and client.host else "unknown"
 
@@ -706,6 +744,26 @@ def create_app(
             "problems": problems,
         })
 
+    @app.exception_handler(Exception)
+    async def _unhandled(request: Request, exc: Exception):
+        """Last-resort envelope for a bug that was not turned into a soft
+        degradation upstream.
+
+        Starlette's default for an uncaught exception is a bare
+        ``Internal Server Error`` body with none of the structure every other
+        response is typed with. This does not make the failure recoverable -- it
+        makes it *legible*: a generated client still parses it, the cause is in
+        the log line, and the caller is not left holding an opaque 500. Known
+        caller mistakes are still caught earlier (``PolicyError``/``PredicateError``/
+        ``RequestValidationError``) and returned as 4xx.
+        """
+        log_event("unhandled_error", path=request.url.path,
+                  error=type(exc).__name__)
+        return JSONResponse(status_code=500, content={
+            "error": "internal_error",
+            "detail": "internal server error",
+        })
+
     def _locale(req_locale: str | None,
                 accept_language: str | None = None) -> str | None:
         return req_locale or server_locale or accept_language
@@ -722,7 +780,11 @@ def create_app(
         # greedy selection runs once per user over a pool sized by count.
         charge(tenant, max(1.0, len(users) * (1.0 + req.count / 10.0)))
         spec = _constraints_spec(req)
-        cand = req.within.item_ids if (req.within and req.within.item_ids) else None
+        # An explicitly empty scoped set means "no candidates", not "no scope".
+        # The previous truthiness test collapsed ``item_ids: []`` into ``None``
+        # and answered from the whole catalogue.
+        cand = (req.within.item_ids
+                if (req.within and req.within.item_ids is not None) else None)
         loc = _locale(req.locale, accept_language)
 
         results = svc.decide_many(tenant, users, count=req.count, goal=req.goal,
@@ -821,6 +883,10 @@ def create_app(
     def signals(req: SignalsRequest, tenant: str = Tenant):
         timer = Timer()
         now = time.time()
+        # Ingestion is not free: each signal is a read-modify-write of a belief
+        # plus, on first sight, an item registration. Charging one token for a
+        # 5000-row batch priced it like a health check.
+        charge(tenant, max(1.0, len(req.signals) / 10.0))
         warnings: list[str] = []
         no_id = sum(1 for s in req.signals if not s.signal_id)
         if no_id:
@@ -859,6 +925,8 @@ def create_app(
 
     @app.post("/v1/items")
     def items(req: ItemsRequest, tenant: str = Tenant):
+        # A 5000-item upsert is a large write; charge for it like the decide path.
+        charge(tenant, max(1.0, len(req.items) / 10.0))
         objs = [Item(id=i.id, tag_weights=i.tags or {},
                      difficulty_prior=i.difficulty_prior, attrs=i.attrs or {})
                 for i in req.items]
@@ -1079,4 +1147,6 @@ _ORDER = {"high": 2, "medium": 1, "low": 0}
 
 
 def _min_conf(a: str, b: str) -> str:
-    return a if _ORDER[a] <= _ORDER[b] else b
+    # ``.get`` rather than indexing: an unexpected confidence string must not
+    # turn a batch summary into a 500.
+    return a if _ORDER.get(a, 2) <= _ORDER.get(b, 2) else b

@@ -68,7 +68,10 @@ class LoggedItem:
     reward: float
     logged_propensity: float
     target_prob: float
-    decision_id: int
+    decision_id: str
+    """Opaque decision handle, matching ``decisions.decision_id`` (a string).
+    Being a string is not cosmetic: the store emits UUID hex, and an estimator
+    that insisted on ``int`` could not consume a real log at all."""
 
 
 @dataclass(frozen=True)
@@ -81,6 +84,11 @@ class OPEResult:
     ess: float
     support: float
     clipped_fraction: float
+    ess_raw: float = 0.0
+    """ESS computed on the *unclipped* weights. The headline ``ess`` is the
+    effective sample size of the estimator as actually applied; when clipping is
+    heavy this number stays healthy-looking because every extreme weight is
+    pinned to the same cap. ``ess_raw`` is the diagnostic that exposes it."""
     dropped_no_propensity: int = 0
     support_known: bool = True
 
@@ -88,14 +96,20 @@ class OPEResult:
         support = f"{self.support:.2%}" if self.support_known else "unknown"
         extra = (f"  dropped_no_propensity={self.dropped_no_propensity}"
                  if self.dropped_no_propensity else "")
+        ess_extra = (f" (raw {self.ess_raw:.1f})"
+                     if self.ess_raw and abs(self.ess_raw - self.ess) > 0.5 else "")
         return (f"slate_value_ips={self.slate_value_ips:.4f} "
                 f"+/-{self.slate_value_se:.4f}  per_item_snips={self.per_item_snips:.4f}  "
-                f"ess={self.ess:.1f}/{self.n_items}  support={support}  "
+                f"ess={self.ess:.1f}{ess_extra}/{self.n_items}  support={support}  "
                 f"clipped={self.clipped_fraction:.2%}{extra}")
 
 
 def evaluate(logged: Sequence[LoggedItem], clip: float = 20.0,
              target_mass: float | None = None) -> OPEResult:
+    if clip <= 0.0:
+        # clip <= 0 zeroes every weight, producing a 0.0 "estimate" that looks
+        # like a finding. A cap has to be positive to cap anything.
+        raise ValueError(f"clip must be > 0, got {clip!r}")
     if not logged:
         return OPEResult(0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
                          dropped_no_propensity=0, support_known=target_mass is not None)
@@ -117,14 +131,15 @@ def evaluate(logged: Sequence[LoggedItem], clip: float = 20.0,
     w = np.minimum(w_raw, clip)
     clipped = float((w_raw > clip).mean())
 
-    dec_ids = np.array([l.decision_id for l in usable])
+    dec_ids = np.array([str(l.decision_id) for l in usable])
     n_dec = int(len(np.unique(dec_ids)))
 
     # Slate value: sum weighted reward within a decision, then average across
     # decisions. Averaging per item instead would silently rescale by slate size.
-    per_dec: dict[int, float] = {}
+    per_dec: dict[str, float] = {}
     for wi, ri, d in zip(w, r, dec_ids):
-        per_dec[int(d)] = per_dec.get(int(d), 0.0) + float(wi * ri)
+        key = str(d)
+        per_dec[key] = per_dec.get(key, 0.0) + float(wi * ri)
     vals = np.array(list(per_dec.values()))
     value = float(vals.mean())
     se = float(vals.std(ddof=1) / math.sqrt(len(vals))) if len(vals) > 1 else 0.0
@@ -132,6 +147,9 @@ def evaluate(logged: Sequence[LoggedItem], clip: float = 20.0,
     sw = float(w.sum())
     snips = float((w * r).sum() / sw) if sw > 0 else 0.0
     ess = float(sw ** 2 / float((w ** 2).sum())) if sw > 0 else 0.0
+    sw_raw = float(w_raw.sum())
+    ess_raw = (float(sw_raw ** 2 / float((w_raw ** 2).sum()))
+               if sw_raw > 0 else 0.0)
 
     # Coverage is only meaningful against a known target mass. Defaulting a
     # missing denominator to "100% covered" reports full support precisely when
@@ -146,7 +164,7 @@ def evaluate(logged: Sequence[LoggedItem], clip: float = 20.0,
 
     return OPEResult(n_items=len(usable), n_decisions=n_dec, slate_value_ips=value,
                      slate_value_se=se, per_item_snips=snips, ess=ess,
-                     support=support, clipped_fraction=clipped,
+                     support=support, clipped_fraction=clipped, ess_raw=ess_raw,
                      dropped_no_propensity=dropped, support_known=support_known)
 
 
@@ -200,7 +218,7 @@ def validate(n_users: int = 150, k: int = 8, warm: int = 40,
             it = pool[int(j)]
             outcome = 1.0 if rng.random() < sim.p_true(user, it.id) else 0.0
             logged.append(LoggedItem(reward=outcome, logged_propensity=prop,
-                                     target_prob=probs[it.id], decision_id=user))
+                                     target_prob=probs[it.id], decision_id=str(user)))
 
         # -- ground truth: what the target policy actually earns -----------
         # E_t[sum_{a in A_t} r_a] = sum_a pi_t(a) * p_true(a). Using the exact

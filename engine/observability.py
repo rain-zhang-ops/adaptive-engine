@@ -123,6 +123,15 @@ class Metrics:
         self._dropped = 0
         self._lock = threading.Lock()
         self.calibration = CalibrationMonitor()
+        # Owner of each counter series, kept beside the key rather than recovered
+        # by parsing it. A tenant label containing the key delimiters could
+        # otherwise be mis-split and a scoped snapshot would reveal another
+        # tenant's series.
+        self._series_tenant: dict[str, str | None] = {}
+        # Per-tenant online-calibration windows. The process-wide ``calibration``
+        # remains the operator's aggregate; a tenant-scoped scrape must not see it,
+        # because ECE is computed over that tenant's own predictions and outcomes.
+        self._calibration_by_tenant: dict[str, CalibrationMonitor] = {}
 
     def incr(self, name: str, by: int = 1, **labels: Any) -> None:
         key = _key(name, labels)
@@ -131,12 +140,26 @@ class Metrics:
                 self._dropped += 1
                 return
             self._counters[key] = self._counters.get(key, 0) + by
+            self._series_tenant.setdefault(key, labels.get("tenant"))
+
+    def record_calibration(self, tenant: str, p_hat: float, outcome: float) -> None:
+        """Feed one (predicted, realised) pair to the process aggregate and to the
+        tenant's own window."""
+        self.calibration.record(p_hat, outcome)
+        with self._lock:
+            mon = self._calibration_by_tenant.get(tenant)
+            if mon is None:
+                mon = self._calibration_by_tenant.setdefault(tenant, CalibrationMonitor())
+        mon.record(p_hat, outcome)
 
     def observe_latency(self, name: str, ms: float) -> None:
         with self._lock:
             q = self._lat.get(name)
             if q is None:
                 if len(self._lat) >= self._max_series:
+                    # Counted like a dropped counter series: overflow that is
+                    # invisible is exactly what this field exists to expose.
+                    self._dropped += 1
                     return
                 q = self._lat.setdefault(name, deque())
             q.append(ms)
@@ -150,15 +173,21 @@ class Metrics:
         tenant's window onto every other tenant's traffic volume, degradation
         rate and throttling. Passing ``tenant`` keeps that tenant's series plus
         the unlabelled process-level ones, which describe the process rather than
-        anyone's data.
+        anyone's data. Calibration is scoped the same way: the process-wide ECE
+        aggregates every tenant's predictions and must not be returned to one.
         """
         with self._lock:
             counters = dict(self._counters)
             lat = {k: sorted(v) for k, v in self._lat.items()}
             dropped = self._dropped
+            owners = dict(self._series_tenant)
+            tenant_cal = self._calibration_by_tenant.get(tenant)
         if tenant is not None:
-            counters = {k: v for k, v in counters.items() if _visible_to(k, tenant)}
-            lat = {k: v for k, v in lat.items() if _visible_to(k, tenant)}
+            def owned(key: str) -> bool:
+                owner = owners.get(key)
+                return owner is None or owner == tenant
+            counters = {k: v for k, v in counters.items() if owned(k)}
+            lat = {k: v for k, v in lat.items() if owned(k)}
         latency = {}
         for name, vals in lat.items():
             if not vals:
@@ -170,19 +199,16 @@ class Metrics:
                 "p99": round(_q(vals, 0.99), 2),
                 "max": round(vals[-1], 2),
             }
-        out = {"counters": counters, "latency_ms": latency,
-               "calibration": self.calibration.snapshot()}
+        if tenant is None:
+            cal = self.calibration.snapshot()
+        elif tenant_cal is not None:
+            cal = tenant_cal.snapshot()
+        else:
+            cal = {"n": 0, "ece": None, "brier": None, "bins": [], "alert": False}
+        out = {"counters": counters, "latency_ms": latency, "calibration": cal}
         if dropped:
             out["series_dropped"] = dropped
         return out
-
-
-def _visible_to(key: str, tenant: str) -> bool:
-    """Whether a series belongs to ``tenant`` or to no tenant at all."""
-    _, labels = _split_key(key)
-    owner = labels.get("tenant")
-    return owner is None or owner == tenant
-
 
 
 def _key(name: str, labels: Mapping[str, Any]) -> str:

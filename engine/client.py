@@ -169,6 +169,11 @@ class AdaptiveClient:
             detail = parsed.get("detail") or parsed.get("error") or (
                 raw.decode("utf-8", "replace")[:200] if raw else e.reason)
             raise AdaptiveError(e.code, str(detail), parsed) from None
+        except urllib.error.URLError as e:             # DNS / refused / timeout
+            # A transport failure is the caller's problem too; letting the raw
+            # urllib exception escape means callers cannot catch one type for
+            # every API failure.
+            raise AdaptiveError(0, f"cannot reach {self.base_url}: {e.reason}", {}) from None
         out = json.loads(raw) if raw else None
         self._surface_warnings(out)
         return out
@@ -242,11 +247,17 @@ class AdaptiveClient:
         return self._request("POST", "/v1/next", body)
 
     def _slates(self, out: Mapping[str, Any]) -> list[Slate]:
+        # Each result carries its own confidence/reason/hint; the top-level
+        # fields are the batch summary (worst confidence, one reason). Reading the
+        # summary for every user mislabelled a healthy user with another user's
+        # degradation and could make ``Slate.degraded`` true for the wrong slate.
         return [
             Slate(client=self, user=r["user"], decision_id=r["decision_id"],
-                  items=list(r["items"]), confidence=out.get("confidence", "low"),
-                  fallback_reason=out.get("fallback_reason"),
-                  hint=out.get("hint"), meta=dict(out.get("meta") or {}))
+                  items=list(r["items"]),
+                  confidence=r.get("confidence", out.get("confidence", "low")),
+                  fallback_reason=r.get("fallback_reason", out.get("fallback_reason")),
+                  hint=r.get("hint", out.get("hint")),
+                  meta=dict(out.get("meta") or {}))
             for r in out.get("results") or []
         ]
 

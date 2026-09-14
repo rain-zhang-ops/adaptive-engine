@@ -538,3 +538,42 @@ def test_cold_user_is_not_reported_as_high_confidence(tmp_path, sim):
     assert r.decision.confidence in ("medium", "low")
     assert r.decision.fallback_reason == "cold_start_no_signals"
 
+
+def test_ope_accepts_string_decision_ids_and_rejects_a_nonpositive_clip():
+    """The store emits decision ids as strings; an estimator that demanded int
+    could not consume a real log. And clip <= 0 zeroes every weight, producing a
+    0.0 'estimate' rather than a cap."""
+    from engine.ope import LoggedItem, evaluate
+
+    logged = [
+        LoggedItem(reward=1.0, logged_propensity=0.5, target_prob=0.5,
+                   decision_id="d1"),
+        LoggedItem(reward=0.0, logged_propensity=0.5, target_prob=0.5,
+                   decision_id="d2"),
+    ]
+    res = evaluate(logged)
+    assert res.n_items == 2 and res.n_decisions == 2
+
+    with pytest.raises(ValueError):
+        evaluate(logged, clip=0.0)
+
+
+def test_predictions_are_keyed_per_decision_not_per_item(tmp_path):
+    """Re-serving an item to the same user before the first outcome arrives must
+    not overwrite the earlier estimate: each served impression is calibrated
+    against its own p_hat, and a decision_id consumes exactly its own row."""
+    store = SqliteStore(tmp_path / "pred.db")
+    try:
+        store.log_predictions("t", "u1", "d1", "m", {"i1": 0.2}, now=1.0)
+        store.log_predictions("t", "u1", "d2", "m", {"i1": 0.9}, now=2.0)
+
+        with store.transaction() as con:
+            assert store.take_prediction("t", "u1", "i1", con, decision_id="d1") == 0.2
+        with store.transaction() as con:
+            # d2's estimate is still there even though d1 was consumed first
+            assert store.take_prediction("t", "u1", "i1", con, decision_id="d2") == 0.9
+        with store.transaction() as con:
+            assert store.take_prediction("t", "u1", "i1", con, decision_id="d1") is None
+    finally:
+        store.close()
+
